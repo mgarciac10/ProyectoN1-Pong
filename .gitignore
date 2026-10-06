@@ -1,0 +1,23 @@
+# C build output
+*.o
+server/server
+
+# Logs
+*.log
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Local agent / team tracking files (shared manually, not committed)
+CLAUDE.md
+PLAN.md
+PROGRESS.md
+.claude/

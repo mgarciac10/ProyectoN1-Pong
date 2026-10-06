@@ -1,0 +1,26 @@
+# PongServer build file.
+#   make        -> builds ./server
+#   make clean  -> removes build output
+
+CC      = gcc
+CFLAGS  = -std=c11 -Wall -Wextra -g -pthread
+LDFLAGS = -pthread
+
+TARGET  = server
+SRCS    = main.c
+OBJS    = $(SRCS:.c=.o)
+
+all: $(TARGET)
+
+# Link: combine all object files into the final executable.
+$(TARGET): $(OBJS)
+	$(CC) $(LDFLAGS) -o $@ $^
+
+# Compile: turn each .c file into a .o (object) file.
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+clean:
+	rm -f $(OBJS) $(TARGET)
+
+.PHONY: all clean
