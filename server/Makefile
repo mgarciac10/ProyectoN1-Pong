@@ -3,7 +3,8 @@
 #   make clean  -> removes build output
 
 CC      = gcc
-CFLAGS  = -std=c11 -Wall -Wextra -g -pthread
+# _POSIX_C_SOURCE: plain -std=c11 hides POSIX extras (sockets helpers, threads...).
+CFLAGS  = -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -g -pthread
 LDFLAGS = -pthread
 
 TARGET  = server
