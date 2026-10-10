@@ -2,20 +2,30 @@
  * PongServer entry point.
  * Usage: ./server <PORT> <LogFile>
  *
- * Phase 1: iterative TCP echo server. It serves ONE client at a time:
- * the next client waits in the kernel's queue until the current one leaves.
+ * Phase 2: concurrent TCP echo server. The main thread only accepts
+ * connections; every client is served by its own thread.
  */
 #include <arpa/inet.h>   /* htons, htonl, ntohs, inet_ntop */
 #include <errno.h>
 #include <netinet/in.h>  /* struct sockaddr_in, INADDR_ANY */
+#include <pthread.h>     /* pthread_create, pthread_detach */
+#include <signal.h>      /* signal, SIGPIPE */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>  /* socket, setsockopt, bind, listen, accept, recv, send */
 #include <unistd.h>      /* close */
 
+#include "logger.h"
+
 #define BACKLOG  10      /* max pending connections queued by the kernel */
 #define BUF_SIZE 1024
+
+/* Everything a client thread needs to know about its client. */
+typedef struct {
+    int  fd;             /* connection socket returned by accept() */
+    char addr[32];       /* "ip:port", used in every log line */
+} Client;
 
 static void print_usage(const char *prog)
 {
@@ -32,7 +42,7 @@ static int create_listen_socket(uint16_t port)
      *    Like open() for files, it returns a file descriptor (a small int). */
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
-        perror("socket");
+        log_event(LOG_ERROR, "socket: %s", strerror(errno));
         return -1;
     }
 
@@ -41,7 +51,7 @@ static int create_listen_socket(uint16_t port)
      * (old connections linger in the TIME_WAIT state). */
     int yes = 1;
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes) < 0) {
-        perror("setsockopt");
+        log_event(LOG_ERROR, "setsockopt: %s", strerror(errno));
         close(fd);
         return -1;
     }
@@ -54,7 +64,7 @@ static int create_listen_socket(uint16_t port)
     addr.sin_port        = htons(port);       /* host -> network byte order */
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
-        perror("bind");
+        log_event(LOG_ERROR, "bind: %s", strerror(errno));
         close(fd);
         return -1;
     }
@@ -62,7 +72,7 @@ static int create_listen_socket(uint16_t port)
     /* 3. listen(): turn it into a passive socket. From now on the KERNEL
      *    completes incoming connections and queues them (up to BACKLOG). */
     if (listen(fd, BACKLOG) < 0) {
-        perror("listen");
+        log_event(LOG_ERROR, "listen: %s", strerror(errno));
         close(fd);
         return -1;
     }
@@ -89,7 +99,7 @@ static int send_all(int fd, const char *buf, size_t len)
 }
 
 /* Echoes everything the client sends until it disconnects. */
-static void serve_client(int client_fd)
+static void serve_client(Client *client)
 {
     char buf[BUF_SIZE];
 
@@ -98,25 +108,39 @@ static void serve_client(int client_fd)
          *   > 0  number of bytes read (maybe fewer than sent: TCP is a byte stream)
          *   = 0  the peer closed the connection
          *   < 0  error */
-        ssize_t n = recv(client_fd, buf, sizeof buf, 0);
+        ssize_t n = recv(client->fd, buf, sizeof buf, 0);
         if (n > 0) {
-            printf("  received %zd bytes: %.*s", n, (int)n, buf);
-            if (buf[n - 1] != '\n')
-                printf("\n");
-            if (send_all(client_fd, buf, (size_t)n) < 0) {
-                perror("send");
+            log_event(LOG_INFO, "%s RECV %zd bytes", client->addr, n);
+            if (send_all(client->fd, buf, (size_t)n) < 0) {
+                log_event(LOG_ERROR, "%s send: %s", client->addr, strerror(errno));
                 return;
             }
+            log_event(LOG_INFO, "%s SEND %zd bytes (echo)", client->addr, n);
         } else if (n == 0) {
-            printf("  client closed the connection\n");
-            return;
+            return; /* peer closed the connection */
         } else {
             if (errno == EINTR)
                 continue;
-            perror("recv");
+            log_event(LOG_ERROR, "%s recv: %s", client->addr, strerror(errno));
             return;
         }
     }
+}
+
+/*
+ * Body of every client thread. pthread_create() requires exactly this
+ * signature: takes a void* and returns a void*.
+ */
+static void *client_thread(void *arg)
+{
+    Client *client = arg; /* void* -> Client*: we know what we passed in */
+
+    serve_client(client);
+
+    close(client->fd);
+    log_event(LOG_INFO, "%s disconnected", client->addr);
+    free(client); /* the thread owns the Client: it was malloc'ed in main() */
+    return NULL;
 }
 
 int main(int argc, char *argv[])
@@ -139,16 +163,23 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    const char *log_path = argv[2];
-    (void)log_path; /* the logger arrives in Phase 2 */
-
-    int listen_fd = create_listen_socket((uint16_t)port);
-    if (listen_fd < 0)
+    if (logger_init(argv[2]) < 0)
         return EXIT_FAILURE;
 
-    printf("PongServer listening on port %ld\n", port);
+    /* By default, send() on a connection the peer already closed raises
+     * SIGPIPE, which KILLS the whole process (every client!). Ignoring it
+     * makes send() just return -1 with errno = EPIPE, which we handle. */
+    signal(SIGPIPE, SIG_IGN);
 
-    /* Iterative server: accept a client, serve it until it leaves, repeat. */
+    int listen_fd = create_listen_socket((uint16_t)port);
+    if (listen_fd < 0) {
+        logger_close();
+        return EXIT_FAILURE;
+    }
+
+    log_event(LOG_INFO, "PongServer listening on port %ld (log file: %s)", port, argv[2]);
+
+    /* The main thread only accepts; each client gets its own thread. */
     for (;;) {
         struct sockaddr_in client_addr;
         socklen_t addr_len = sizeof client_addr;
@@ -158,24 +189,44 @@ int main(int argc, char *argv[])
          *    client; listen_fd keeps listening for others. */
         int client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &addr_len);
         if (client_fd < 0) {
-            if (errno == EINTR)
-                continue;
-            perror("accept");
+            if (errno != EINTR)
+                log_event(LOG_ERROR, "accept: %s", strerror(errno));
             continue;
         }
 
+        /* Heap-allocate the client's data: it must outlive this loop
+         * iteration, because the new thread keeps using it. */
+        Client *client = malloc(sizeof *client);
+        if (client == NULL) {
+            log_event(LOG_ERROR, "malloc failed, dropping connection");
+            close(client_fd);
+            continue;
+        }
+        client->fd = client_fd;
+
         char ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof ip);
-        printf("Client connected from %s:%d\n", ip, ntohs(client_addr.sin_port));
+        snprintf(client->addr, sizeof client->addr, "%s:%d", ip, ntohs(client_addr.sin_port));
 
-        serve_client(client_fd);
+        log_event(LOG_INFO, "%s connected", client->addr);
 
-        /* 5. close(): release the connection socket. */
-        close(client_fd);
-        printf("Client %s:%d disconnected\n", ip, ntohs(client_addr.sin_port));
+        /* 5. Start a thread running client_thread(client). */
+        pthread_t tid;
+        int err = pthread_create(&tid, NULL, client_thread, client);
+        if (err != 0) {
+            log_event(LOG_ERROR, "pthread_create: %s", strerror(err));
+            close(client_fd);
+            free(client);
+            continue;
+        }
+
+        /* Detached: nobody waits for this thread; its resources are freed
+         * automatically when it finishes. */
+        pthread_detach(tid);
     }
 
     /* Not reached for now; a clean shutdown comes in a later phase. */
     close(listen_fd);
+    logger_close();
     return EXIT_SUCCESS;
 }

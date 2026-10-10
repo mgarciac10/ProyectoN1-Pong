@@ -8,8 +8,9 @@ CFLAGS  = -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -g -pthread
 LDFLAGS = -pthread
 
 TARGET  = server
-SRCS    = main.c
+SRCS    = main.c logger.c
 OBJS    = $(SRCS:.c=.o)
+HDRS    = logger.h
 
 all: $(TARGET)
 
@@ -18,7 +19,8 @@ $(TARGET): $(OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^
 
 # Compile: turn each .c file into a .o (object) file.
-%.o: %.c
+# Listing $(HDRS) makes a header change trigger a rebuild too.
+%.o: %.c $(HDRS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
