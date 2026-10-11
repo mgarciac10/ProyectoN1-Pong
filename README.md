@@ -41,6 +41,16 @@ time. The alternative, a single thread multiplexing sockets with `select()`/`pol
 thousands of connections, but it is harder to follow. For the scale of this project (tens of players) threads
 are enough, the assignment explicitly allows them, and each thread reads like a simple sequential program.
 
+**Server source files (`server/`)**
+
+| File | Responsibility |
+|---|---|
+| `main.c` | Listening socket, `accept()` loop, one detached thread per client. |
+| `session.c` | What a client thread does: read messages, apply the state machine of 2.3.7, answer. Also the registry of connected nicknames (protected by a mutex). |
+| `protocol.c` | PongProtocol v1 only: exact `send`/`recv` of bytes, header and payload encoding/decoding, validation. It knows nothing about threads or sessions. |
+| `sockopts.c` | Options set on every client socket (`TCP_NODELAY`, keepalive, `TCP_USER_TIMEOUT`). |
+| `logger.c` | Thread-safe logger (see 2.4). |
+
 ### 2.2 Transport: why TCP
 
 PongProtocol runs over **TCP (`SOCK_STREAM`)** only, with one connection per client.
@@ -173,6 +183,21 @@ The header's `length` must be exactly `2 + nick_len + email_len`.
 Codes 1 and 2 close the connection because, after a malformed header, the receiver can no longer tell
 where the next message starts: the byte stream is out of sync.
 
+**Validation order.** The server checks every incoming message in this order and answers with the first
+error it finds:
+
+1. `version` ≠ 1 → `ERROR(1)`.
+2. `length` > 255 → `ERROR(2)`.
+3. `type` is not a message a client may send → `ERROR(2)`. (Up to here the payload is **not** read.)
+4. The message is not allowed in the client's state → `ERROR(4)`, except a late `INPUT` (rule 7 in 2.3.7).
+5. The payload does not fit the message layout (e.g. `length` ≠ 2 + `nick_len` + `email_len`, or a non-empty `JOIN`/`QUIT`) → `ERROR(2)`.
+6. A field breaks its rule (2.3.4) → `ERROR(5)`.
+
+When the server closes the connection after `ERROR(1)` or `ERROR(2)`, it first stops sending
+(`shutdown`) and discards, for at most about 3 seconds, whatever the client is still sending. Closing a
+socket that has unread incoming data makes Linux reset the connection (RST), and the client could lose
+the `ERROR` message that was just sent.
+
 #### 2.3.6 Game constants
 
 Both applications use these fixed values. They are part of the specification and are never sent.
@@ -216,7 +241,7 @@ stateDiagram-v2
 
 **Rules**
 
-1. **Registration first.** A client must register before anything else. The nickname must be unique among *connected* players. Profiles live in memory and are released when the client disconnects.
+1. **Registration first.** A client must register before anything else. The nickname must be unique among *connected* players, **ignoring upper/lower case** (`ana` and `Ana` are the same nickname). Profiles live in memory and are released when the client disconnects.
 2. **Matchmaking.** On `JOIN`, if another player is waiting, both are paired at once and receive `MATCH_START`. Otherwise the client receives `WAITING` and is paired with the next player who joins.
 3. **Authoritative server.** `INPUT` only changes the paddle's *direction*. The server moves the paddle at its own fixed speed, keeps it inside the field, moves the ball, detects collisions and goals, and keeps the score. Clients never send positions.
 4. **State broadcast.** During a match, the server sends `STATE` to both players every tick. The client sends `INPUT` only when the direction **changes** (not every frame).
@@ -320,9 +345,21 @@ sequenceDiagram
 Every line has the format `YYYY-MM-DD HH:MM:SS [LEVEL] message`, with `LEVEL` ∈ {`INFO`, `WARN`, `ERROR`}.
 Messages related to a client start with its `ip:port`. The same line goes to the console and to the log file.
 
+For every client message the server logs the raw bytes in hexadecimal (`RECV <TYPE> [bytes]`), then what
+it decoded, then what it answered (`SEND <TYPE>`). The hex can be compared byte by byte with the spec in
+2.3.9 or with `tcpdump`. Text fields (nickname, e-mail) are written to the log only after they pass
+validation, so a client cannot inject fake lines into the log with line breaks or control characters.
+High-frequency messages (`STATE`) are not logged.
+
 ```
-2026-10-10 00:42:39 [INFO] 127.0.0.1:54570 connected
-2026-10-10 00:42:41 [ERROR] 127.0.0.1:59724 send: Connection reset by peer
+2026-10-11 17:26:35 [INFO] 127.0.0.1:36974 connected
+2026-10-11 17:26:35 [INFO] 127.0.0.1:36974 RECV REGISTER [01 01 00 11 03 61 6e 61 0c 61 6e 61 40 74 65 73 74 2e 63 6f 6d]
+2026-10-11 17:26:35 [INFO] 127.0.0.1:36974 REGISTER nick=ana email=ana@test.com
+2026-10-11 17:26:35 [INFO] 127.0.0.1:36974 registered as 'ana'
+2026-10-11 17:26:35 [INFO] 127.0.0.1:36974 SEND REGISTER_OK
+2026-10-11 17:26:35 [WARN] 127.0.0.1:36986 rejected: nickname 'ANA' is already in use
+2026-10-11 17:26:35 [INFO] 127.0.0.1:36986 SEND ERROR code=3 (NICK_TAKEN)
+2026-10-11 17:26:39 [WARN] 127.0.0.1:37012 rejected: unsupported protocol version 104
 ```
 
 ### 2.5 Build and run
@@ -335,7 +372,27 @@ make
 ./server <PORT> <LogFile>      # e.g. ./server 5000 pong.log
 ```
 
-**Client**: *to be completed (Phase 7).*
+**Test bot** (Python 3, standard library only; the pygame client arrives in Phase 7):
+
+```bash
+cd client
+python bot.py --nick ana                        # register, print the server's reply, send QUIT
+python bot.py --nick ana --hold 20              # stay registered for 20 s before QUIT
+python bot.py --nick ana --host 1.2.3.4 --port 5000 --email ana@x.co
+```
+
+Run `bot.py --nick ana --hold 20` and, meanwhile, a second `bot.py --nick ANA`: the second one receives
+`ERROR code=3 (NICK_TAKEN)`.
+
+**Inspecting the protocol by hand** (Linux). A garbage message gets `ERROR(1)` and the connection is
+closed, but the server keeps running:
+
+```bash
+printf 'hola\n' | nc -N localhost 5000 | xxd    # -> 01ff 0001 01
+sudo tcpdump -i lo -X -nn port 5000             # raw bytes of a bot session (run the bot from the same machine)
+```
+
+**Pong client (pygame)**: *to be completed (Phase 7).*
 
 ---
 
