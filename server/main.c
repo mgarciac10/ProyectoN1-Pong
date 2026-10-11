@@ -184,4 +184,3 @@ int main(int argc, char *argv[])
     close(listen_fd);
     logger_close();
     return EXIT_SUCCESS;
-}

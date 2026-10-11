@@ -8,9 +8,9 @@ CFLAGS  = -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -g -pthread
 LDFLAGS = -pthread
 
 TARGET  = server
-SRCS    = main.c logger.c
+SRCS    = main.c logger.c protocol.c sockopts.c session.c
 OBJS    = $(SRCS:.c=.o)
-HDRS    = logger.h
+HDRS    = logger.h protocol.h sockopts.h session.h
 
 all: $(TARGET)
 
