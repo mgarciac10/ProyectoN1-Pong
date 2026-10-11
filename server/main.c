@@ -2,14 +2,15 @@
  * PongServer entry point.
  * Usage: ./server <PORT> <LogFile>
  *
- * Phase 2: concurrent TCP echo server. The main thread only accepts
- * connections; every client is served by its own thread.
+ * The main thread only accepts connections; every client is served by its
+ * own thread, which runs a session (see session.c) speaking PongProtocol.
  */
 #include <arpa/inet.h>   /* htons, htonl, ntohs, inet_ntop */
 #include <errno.h>
 #include <netinet/in.h>  /* struct sockaddr_in, INADDR_ANY */
 #include <pthread.h>     /* pthread_create, pthread_detach */
 #include <signal.h>      /* signal, SIGPIPE */
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,9 +18,10 @@
 #include <unistd.h>      /* close */
 
 #include "logger.h"
+#include "session.h"
+#include "sockopts.h"
 
 #define BACKLOG  10      /* max pending connections queued by the kernel */
-#define BUF_SIZE 1024
 
 /* Everything a client thread needs to know about its client. */
 typedef struct {
@@ -80,54 +82,6 @@ static int create_listen_socket(uint16_t port)
 }
 
 /*
- * send() may write fewer bytes than requested, so keep calling it until
- * everything is sent. Returns 0 on success, -1 on error.
- */
-static int send_all(int fd, const char *buf, size_t len)
-{
-    size_t sent = 0;
-    while (sent < len) {
-        ssize_t n = send(fd, buf + sent, len - sent, 0);
-        if (n < 0) {
-            if (errno == EINTR)   /* interrupted by a signal: just retry */
-                continue;
-            return -1;
-        }
-        sent += (size_t)n;
-    }
-    return 0;
-}
-
-/* Echoes everything the client sends until it disconnects. */
-static void serve_client(Client *client)
-{
-    char buf[BUF_SIZE];
-
-    for (;;) {
-        /* recv() blocks until data arrives. It returns:
-         *   > 0  number of bytes read (maybe fewer than sent: TCP is a byte stream)
-         *   = 0  the peer closed the connection
-         *   < 0  error */
-        ssize_t n = recv(client->fd, buf, sizeof buf, 0);
-        if (n > 0) {
-            log_event(LOG_INFO, "%s RECV %zd bytes", client->addr, n);
-            if (send_all(client->fd, buf, (size_t)n) < 0) {
-                log_event(LOG_ERROR, "%s send: %s", client->addr, strerror(errno));
-                return;
-            }
-            log_event(LOG_INFO, "%s SEND %zd bytes (echo)", client->addr, n);
-        } else if (n == 0) {
-            return; /* peer closed the connection */
-        } else {
-            if (errno == EINTR)
-                continue;
-            log_event(LOG_ERROR, "%s recv: %s", client->addr, strerror(errno));
-            return;
-        }
-    }
-}
-
-/*
  * Body of every client thread. pthread_create() requires exactly this
  * signature: takes a void* and returns a void*.
  */
@@ -135,7 +89,8 @@ static void *client_thread(void *arg)
 {
     Client *client = arg; /* void* -> Client*: we know what we passed in */
 
-    serve_client(client);
+    configure_client_socket(client->fd, client->addr);
+    session_run(client->fd, client->addr);
 
     close(client->fd);
     log_event(LOG_INFO, "%s disconnected", client->addr);
