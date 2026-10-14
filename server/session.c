@@ -325,12 +325,14 @@ void session_run(int fd, const char *peer)
         break;
     }
 
-    if (server_closes)
-        lingering_close(fd);
-
-    /* The nickname is released when the player leaves, however they left. */
+    /* The nickname is released as soon as the session ends, however the player
+     * left. Do it BEFORE lingering_close(), which may wait up to ~3 s: the player
+     * is already gone for the protocol, so its nick must be free right away. */
     if (s.state != ST_CONNECTED) {
         registry_remove(s.nick);
         log_event(LOG_INFO, "%s nickname '%s' released", peer, s.nick);
     }
+
+    if (server_closes)
+        lingering_close(fd);
 }
