@@ -49,7 +49,22 @@ are enough, the assignment explicitly allows them, and each thread reads like a 
 | `session.c` | What a client thread does: read messages, apply the state machine of 2.3.7, answer. Also the registry of connected nicknames (protected by a mutex). |
 | `protocol.c` | PongProtocol v1 only: exact `send`/`recv` of bytes, header and payload encoding/decoding, validation. It knows nothing about threads or sessions. |
 | `sockopts.c` | Options set on every client socket (`TCP_NODELAY`, keepalive, `TCP_USER_TIMEOUT`). |
+| `player.c` | The `Player` object shared between threads, and `player_send()` (one writer at a time per socket). |
+| `lobby.c` | Matchmaking queue: one waiting slot, first come, first served. |
+| `game.c` | Matches: creation, the match thread, and how a match ends. Owns `game_lock`. |
 | `logger.c` | Thread-safe logger (see 2.4). |
+
+**Shared state and synchronization.** Several threads work on the same player: its own client thread,
+the client thread of the player who pairs with it, and the match thread. Three mechanisms keep this safe:
+
+| Mechanism | Protects | Why |
+|---|---|---|
+| `game_lock` (one global mutex) | The lobby's waiting slot, each player's state / match / side, every match | Pairing, leaving and state changes are *check-then-act* operations: without the lock, two players joining at the same moment could both be paired with the same waiting player. One lock is simple and enough here, because the critical sections are tiny and network sends happen outside it. |
+| `send_lock` (one mutex per player) | Writing to that player's socket | The client thread, the lobby and the match thread may all send to the same client. The lock keeps the bytes of two messages from interleaving on the wire. |
+| `refs` counter + condition variable | The lifetime of a `Player` | A match keeps using its players (it sends `GAME_OVER` to them). A client thread whose player is still referenced waits (`pthread_cond_wait`) before it ends. Otherwise the match could write to freed memory, or to a socket number the OS has already reused for a new client. |
+
+Message order is guaranteed by design: `WAITING` is sent while `game_lock` is held, so no `MATCH_START`
+can overtake it. The match thread is the only sender of `MATCH_START`, `STATE` and `GAME_OVER`.
 
 ### 2.2 Transport: why TCP
 
@@ -378,11 +393,16 @@ make
 cd client
 python bot.py --nick ana                        # register, print the server's reply, send QUIT
 python bot.py --nick ana --hold 20              # stay registered for 20 s before QUIT
+python bot.py --nick ana --join --hold 30       # JOIN the queue and print what arrives for 30 s
 python bot.py --nick ana --host 1.2.3.4 --port 5000 --email ana@x.co
 ```
 
 Run `bot.py --nick ana --hold 20` and, meanwhile, a second `bot.py --nick ANA`: the second one receives
 `ERROR code=3 (NICK_TAKEN)`.
+
+Run two bots with `--join --hold 30` at the same time: the first receives `WAITING`, then both receive
+`MATCH_START` with opposite sides. Stop one of them with Ctrl+C: the other receives
+`GAME_OVER winner=… reason=1 (opponent left)`.
 
 **Inspecting the protocol by hand** (Linux). A garbage message gets `ERROR(1)` and the connection is
 closed, but the server keeps running:

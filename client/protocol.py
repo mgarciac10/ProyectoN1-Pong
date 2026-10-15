@@ -107,11 +107,33 @@ def hex_bytes(data):
     return data.hex(" ")
 
 
+def decode_match_start(payload):
+    """MATCH_START payload: side:u8, opp_len:u8, opp_nick. Returns (side, opponent)."""
+    side, opp_len = payload[0], payload[1]
+    return side, payload[2:2 + opp_len].decode("ascii")
+
+
+def decode_game_over(payload):
+    """GAME_OVER payload: winner:u8, reason:u8. Returns (winner, reason)."""
+    return payload[0], payload[1]
+
+
+SIDE_NAMES = {0: "left", 1: "right"}
+REASON_NAMES = {0: "score", 1: "opponent left"}
+
+
 def describe(msg_type, payload):
     """Human-readable text for a message received from the server."""
     name = TYPE_NAMES.get(msg_type, "UNKNOWN(0x%02x)" % msg_type)
     if msg_type == MSG_ERROR and len(payload) == 1:
         return "ERROR code=%d (%s)" % (payload[0], ERROR_NAMES.get(payload[0], "?"))
+    if msg_type == MSG_MATCH_START and len(payload) >= 2:
+        side, opponent = decode_match_start(payload)
+        return "MATCH_START side=%d (%s) opponent=%s" % (side, SIDE_NAMES.get(side, "?"), opponent)
+    if msg_type == MSG_GAME_OVER and len(payload) == 2:
+        winner, reason = decode_game_over(payload)
+        return "GAME_OVER winner=%d (%s) reason=%d (%s)" % (
+            winner, SIDE_NAMES.get(winner, "?"), reason, REASON_NAMES.get(reason, "?"))
     if payload:
         return "%s payload=[%s]" % (name, hex_bytes(payload))
     return name
