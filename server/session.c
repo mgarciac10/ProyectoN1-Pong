@@ -6,7 +6,7 @@
  *     CONNECTED --REGISTER--> REGISTERED --JOIN--> WAITING --> PLAYING
  *
  * The client thread handles REGISTER, JOIN and QUIT. Pairing is done by the
- * lobby, and the match itself by its own thread (game.c). INPUT arrives in phase 6.
+ * lobby, and the match itself by its own thread (game.c). INPUT is forwarded to the match (game_set_input).
  *
  * The player's state is shared with other threads (the lobby and the match
  * thread change it), so it is always read and written under game_lock.
@@ -228,6 +228,19 @@ static Action handle_join(Player *s, const ProtoHeader *hdr)
     return ACTION_KEEP;
 }
 
+/* INPUT (README 2.3.4): one byte, dir = 0 stop / 1 up / 2 down. Only reached in
+ * PLAYING (a late INPUT was already discarded by handle_message). */
+static Action handle_input(Player *s, const ProtoHeader *hdr, const uint8_t *payload)
+{
+    if (hdr->length != 1)
+        return reply_error(s, ERR_BAD_MESSAGE, "INPUT must have a 1-byte payload");
+    if (payload[0] > 2)
+        return reply_error(s, ERR_INVALID_FIELD, "INPUT dir must be 0, 1 or 2");
+
+    game_set_input(s, payload[0]);
+    return ACTION_KEEP;
+}
+
 static Action handle_quit(Player *s, const ProtoHeader *hdr)
 {
     if (hdr->length != 0)
@@ -267,10 +280,9 @@ static Action handle_message(Player *s, const ProtoHeader *hdr, const uint8_t *p
     switch (hdr->type) {
     case MSG_REGISTER: return handle_register(s, hdr, payload);
     case MSG_JOIN:     return handle_join(s, hdr);
+    case MSG_INPUT:    return handle_input(s, hdr, payload);
     case MSG_QUIT:     return handle_quit(s, hdr);
-    default:
-        /* MSG_INPUT while PLAYING (phase 6). proto_recv only lets client types through. */
-        return ACTION_KEEP;
+    default:           return ACTION_KEEP;   /* proto_recv only lets client types through */
     }
 }
 

@@ -19,6 +19,11 @@ extern pthread_mutex_t game_lock;
  * thread sends MATCH_START to both. Call with game_lock held. */
 void match_create(Player *left, Player *right);
 
+/* Records the direction (0 = stop, 1 = up, 2 = down) requested by player `p`.
+ * It only takes effect on the next tick. Silently ignored if `p` is not in a
+ * match any more (an INPUT can cross a GAME_OVER). Takes game_lock itself. */
+void game_set_input(Player *p, uint8_t dir);
+
 /* Called by a client thread when its session ends (QUIT, disconnection or
  * protocol error). Leaves the queue or the match (the opponent gets
  * GAME_OVER with reason 1), then BLOCKS until no match uses `p` any more.

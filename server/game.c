@@ -13,16 +13,35 @@
  */
 #include "game.h"
 
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>  /* shutdown */
-#include <time.h>        /* nanosleep */
+#include <time.h>        /* clock_gettime, clock_nanosleep */
 
 #include "lobby.h"
 #include "logger.h"
 
 #define TICKS_PER_SECOND 30                       /* README 2.3.6 */
 #define TICK_NS          (1000000000L / TICKS_PER_SECOND)
+
+/* Game constants (README 2.3.6): the same values the client uses. */
+#define FIELD_W        800
+#define FIELD_H        600
+#define PADDLE_W       10
+#define PADDLE_H       80
+#define PADDLE_X_LEFT  20
+#define PADDLE_X_RIGHT 770
+#define BALL_SIZE      10
+#define WIN_SCORE      5
+
+/* Tuning that only the server knows (units per tick; x30 = units per second). */
+#define PADDLE_SPEED     9.0   /* 270 units/s */
+#define BALL_SPEED_START 8.0
+#define BALL_SPEED_MAX   16.0  /* must stay < PADDLE_W + BALL_SIZE, or the ball could skip over a paddle */
+#define BALL_SPEEDUP     1.06  /* the ball gets 6% faster at every paddle hit */
+#define BALL_MAX_VY      9.0
+#define SERVE_DELAY_TICKS 20   /* ball waits ~0.66 s in the centre after each goal */
 
 /* GAME_OVER reasons (README 2.3.4). */
 #define REASON_SCORE         0
@@ -37,6 +56,15 @@ static pthread_cond_t players_released = PTHREAD_COND_INITIALIZER;
 typedef struct Match {
     Player *p[2];      /* p[0] = left, p[1] = right. Fixed after creation. */
     int     gone[2];   /* [game_lock] 1 once that player quit or disconnected */
+    int     dir[2];    /* [game_lock] last INPUT of each player: 0 stop, 1 up, 2 down */
+
+    /* Simulation: touched ONLY by the match thread, so it needs no lock. */
+    double  bx, by;    /* ball's top-left corner */
+    double  vx, vy;    /* ball velocity, units per tick */
+    double  py[2];     /* paddles' top edge */
+    int     score[2];
+    int     serve_delay;   /* ticks left before the ball starts moving */
+    unsigned seed;         /* for rand_r (thread-safe, unlike rand) */
 } Match;
 
 /* ============================================================ match messages */
@@ -62,7 +90,137 @@ static void send_game_over(Player *p, int winner, int reason)
     uint8_t payload[2] = { (uint8_t)winner, (uint8_t)reason };
     if (player_send(p, MSG_GAME_OVER, payload, sizeof payload) == 0)
         log_event(LOG_INFO, "%s SEND GAME_OVER winner=%d reason=%d (%s)", p->peer, winner, reason,
-                  reason == REASON_SCORE ? "score" : "opponent left");
+                reason == REASON_SCORE ? "score" : "opponent left");
+}
+
+/* ============================================================== simulation */
+
+/* Puts the ball in the centre and serves it toward `toward` (0 = left, 1 = right). */
+static void serve(Match *m, int toward)
+{
+    m->bx = (FIELD_W - BALL_SIZE) / 2.0;
+    m->by = (FIELD_H - BALL_SIZE) / 2.0;
+    m->vx = (toward == 0) ? -BALL_SPEED_START : BALL_SPEED_START;
+    m->vy = (double)((int)(rand_r(&m->seed) % 9) - 4);   /* -4 .. +4 */
+    m->serve_delay = SERVE_DELAY_TICKS;
+}
+
+static void match_init_game(Match *m)
+{
+    m->seed = (unsigned)time(NULL) ^ (unsigned)(size_t)m;
+    m->py[0] = m->py[1] = (FIELD_H - PADDLE_H) / 2.0;
+    m->score[0] = m->score[1] = 0;
+    serve(m, (int)(rand_r(&m->seed) % 2));
+}
+
+/* The ball hits a paddle whose top edge is `paddle_y`: bounce it and send it
+ * back faster, at an angle that depends on WHERE it hit (centre = straight,
+ * edges = steep). `new_vx_sign` is the new horizontal direction. */
+static void bounce_on_paddle(Match *m, double paddle_y, int new_vx_sign)
+{
+    double ball_c   = m->by + BALL_SIZE / 2.0;
+    double paddle_c = paddle_y + PADDLE_H / 2.0;
+    double offset   = (ball_c - paddle_c) / (PADDLE_H / 2.0 + BALL_SIZE / 2.0);  /* about -1 .. +1 */
+    if (offset < -1.0) offset = -1.0;
+    if (offset >  1.0) offset =  1.0;
+
+    double speed = (m->vx < 0 ? -m->vx : m->vx) * BALL_SPEEDUP;
+    if (speed > BALL_SPEED_MAX) speed = BALL_SPEED_MAX;
+
+    m->vx = new_vx_sign * speed;
+    m->vy = offset * BALL_MAX_VY;
+}
+
+/* Advances the game ONE tick with the players' directions `dir`.
+ * Returns the winner's side if somebody reached WIN_SCORE, otherwise -1. */
+static int step_game(Match *m, const int dir[2])
+{
+    /* 1. Paddles: INPUT only chose a direction, the server moves them. */
+    for (int s = 0; s < 2; s++) {
+        if (dir[s] == 1)      m->py[s] -= PADDLE_SPEED;
+        else if (dir[s] == 2) m->py[s] += PADDLE_SPEED;
+        if (m->py[s] < 0)                   m->py[s] = 0;
+        if (m->py[s] > FIELD_H - PADDLE_H)  m->py[s] = FIELD_H - PADDLE_H;
+    }
+
+    /* 2. Short pause after each serve. */
+    if (m->serve_delay > 0) {
+        m->serve_delay--;
+        return -1;
+    }
+
+    /* 3. Ball. */
+    m->bx += m->vx;
+    m->by += m->vy;
+
+    if (m->by < 0) {                                  /* top wall */
+        m->by = -m->by;
+        m->vy = -m->vy;
+    } else if (m->by > FIELD_H - BALL_SIZE) {         /* bottom wall */
+        m->by = 2.0 * (FIELD_H - BALL_SIZE) - m->by;
+        m->vy = -m->vy;
+    }
+
+    /* Left paddle: occupies x in [20, 30). Only a ball moving left can hit it. */
+    if (m->vx < 0 &&
+        m->bx < PADDLE_X_LEFT + PADDLE_W && m->bx + BALL_SIZE > PADDLE_X_LEFT &&
+        m->by + BALL_SIZE > m->py[0] && m->by < m->py[0] + PADDLE_H) {
+        m->bx = PADDLE_X_LEFT + PADDLE_W;
+        bounce_on_paddle(m, m->py[0], +1);
+    }
+    /* Right paddle: occupies x in [770, 780). Only a ball moving right can hit it. */
+    else if (m->vx > 0 &&
+            m->bx + BALL_SIZE > PADDLE_X_RIGHT && m->bx < PADDLE_X_RIGHT + PADDLE_W &&
+            m->by + BALL_SIZE > m->py[1] && m->by < m->py[1] + PADDLE_H) {
+        m->bx = PADDLE_X_RIGHT - BALL_SIZE;
+        bounce_on_paddle(m, m->py[1], -1);
+    }
+
+    /* 4. Goals: the ball left the field through a side. */
+    int scorer = -1;
+    if (m->bx + BALL_SIZE < 0)       scorer = 1;      /* went out on the left: right scores */
+    else if (m->bx > FIELD_W)        scorer = 0;      /* went out on the right: left scores */
+
+    if (scorer >= 0) {
+        m->score[scorer]++;
+        log_event(LOG_INFO, "goal: '%s' scores (%d-%d) in '%s' vs '%s'", m->p[scorer]->nick,
+                  m->score[0], m->score[1], m->p[0]->nick, m->p[1]->nick);
+        if (m->score[scorer] >= WIN_SCORE)
+            return scorer;
+        serve(m, 1 - scorer);                         /* serve toward the one who conceded */
+    }
+    return -1;
+}
+
+/* Position -> u16 for the wire (positions are integers, README 2.3.6). */
+static uint16_t to_u16(double v)
+{
+    if (v < 0) v = 0;
+    if (v > 65535) v = 65535;
+    return (uint16_t)(v + 0.5);
+}
+
+static void put_u16(uint8_t *out, uint16_t v)
+{
+    out[0] = (uint8_t)(v >> 8);       /* big endian, like every field on the wire */
+    out[1] = (uint8_t)(v & 0xFF);
+}
+
+/* STATE (README 2.3.4): ball_x, ball_y, left_y, right_y (u16) + score_l, score_r (u8).
+ * Not logged: it is sent 30 times per second (README logger section). */
+static void send_state(Match *m, const int gone[2])
+{
+    uint8_t payload[10];
+    put_u16(payload + 0, to_u16(m->bx));
+    put_u16(payload + 2, to_u16(m->by));
+    put_u16(payload + 4, to_u16(m->py[0]));
+    put_u16(payload + 6, to_u16(m->py[1]));
+    payload[8] = (uint8_t)m->score[0];
+    payload[9] = (uint8_t)m->score[1];
+
+    for (int side = 0; side < 2; side++)
+        if (!gone[side])
+            player_send(m->p[side], MSG_STATE, payload, sizeof payload);
 }
 
 /* ================================================================ ending */
@@ -84,7 +242,7 @@ static void match_end(Match *m, int winner, int reason)
     pthread_mutex_unlock(&game_lock);
 
     log_event(LOG_INFO, "match '%s' vs '%s' over: winner=%s (%s)", m->p[0]->nick, m->p[1]->nick,
-              m->p[winner]->nick, reason == REASON_SCORE ? "score" : "opponent left");
+            m->p[winner]->nick, reason == REASON_SCORE ? "score" : "opponent left");
 
     /* 2. Tell the players who are still connected. They cannot vanish meanwhile:
      *    our references (refs) keep their client threads alive. */
@@ -104,10 +262,14 @@ static void match_end(Match *m, int winner, int reason)
 
 /* ========================================================== match thread */
 
-static void sleep_one_tick(void)
+/* Adds one tick to `t` (a timespec). */
+static void add_tick(struct timespec *t)
 {
-    struct timespec ts = { .tv_sec = 0, .tv_nsec = TICK_NS };
-    nanosleep(&ts, NULL);
+    t->tv_nsec += TICK_NS;
+    if (t->tv_nsec >= 1000000000L) {
+        t->tv_nsec -= 1000000000L;
+        t->tv_sec++;
+    }
 }
 
 static void *match_thread(void *arg)
@@ -117,18 +279,37 @@ static void *match_thread(void *arg)
     send_match_start(m, 0);
     send_match_start(m, 1);
 
-    /* One iteration per tick (~33 ms). Phase 6 adds here: apply the inputs,
-     * move ball and paddles, detect goals, send STATE to both players. */
+    /* Absolute deadlines: each tick ends at start + n * 33 ms, so the time spent
+     * simulating and sending does not accumulate as drift (a plain sleep(33 ms)
+     * would make the game slower than 30 ticks/s). */
+    struct timespec next;
+    clock_gettime(CLOCK_MONOTONIC, &next);
+
     int gone[2];
+    int dir[2];
     for (;;) {
+        /* Take a snapshot of the shared fields; simulate and send OUTSIDE the lock. */
         pthread_mutex_lock(&game_lock);
         gone[0] = m->gone[0];
         gone[1] = m->gone[1];
+        dir[0]  = m->dir[0];
+        dir[1]  = m->dir[1];
         pthread_mutex_unlock(&game_lock);
 
         if (gone[0] || gone[1])
             break;
-        sleep_one_tick();
+
+        int winner = step_game(m, dir);
+        send_state(m, gone);          /* the last STATE shows the final score */
+
+        if (winner >= 0) {
+            match_end(m, winner, REASON_SCORE);
+            return NULL;
+        }
+
+        add_tick(&next);
+        while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL) == EINTR)
+            ;
     }
 
     /* The player who stayed wins (README rule 6). */
@@ -159,6 +340,7 @@ void match_create(Player *left, Player *right)
     }
     m->p[0] = left;
     m->p[1] = right;
+    match_init_game(m);
 
     for (int side = 0; side < 2; side++) {
         Player *p = m->p[side];
@@ -182,7 +364,15 @@ void match_create(Player *left, Player *right)
     }
     pthread_detach(tid);
     log_event(LOG_INFO, "match started: '%s' (left, %s) vs '%s' (right, %s)",
-              left->nick, left->peer, right->nick, right->peer);
+            left->nick, left->peer, right->nick, right->peer);
+}
+
+void game_set_input(Player *p, uint8_t dir)
+{
+    pthread_mutex_lock(&game_lock);
+    if (p->state == ST_PLAYING && p->match != NULL)
+        p->match->dir[p->side] = dir;
+    pthread_mutex_unlock(&game_lock);
 }
 
 void game_player_leave(Player *p)
