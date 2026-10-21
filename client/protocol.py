@@ -50,6 +50,22 @@ ERROR_NAMES = {
 }
 
 
+# INPUT directions (payload of MSG_INPUT).
+DIR_STOP = 0
+DIR_UP = 1
+DIR_DOWN = 2
+
+# Game constants (README 2.3.6): fixed by the spec, never sent on the wire.
+FIELD_W, FIELD_H = 800, 600
+PADDLE_W, PADDLE_H = 10, 80
+PADDLE_X_LEFT, PADDLE_X_RIGHT = 20, 770
+BALL_SIZE = 10
+WIN_SCORE = 5
+
+# STATE payload: ball_x, ball_y, left_y, right_y (u16) + score_l, score_r (u8) = 10 bytes.
+STATE_FORMAT = "!HHHHBB"
+
+
 class ConnectionClosed(Exception):
     """The server closed the connection."""
 
@@ -111,6 +127,11 @@ def decode_match_start(payload):
     """MATCH_START payload: side:u8, opp_len:u8, opp_nick. Returns (side, opponent)."""
     side, opp_len = payload[0], payload[1]
     return side, payload[2:2 + opp_len].decode("ascii")
+
+
+def decode_state(payload):
+    """STATE payload -> (ball_x, ball_y, left_y, right_y, score_l, score_r)."""
+    return struct.unpack(STATE_FORMAT, payload)
 
 
 def decode_game_over(payload):

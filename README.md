@@ -51,7 +51,17 @@ are enough, the assignment explicitly allows them, and each thread reads like a 
 | `sockopts.c` | Options set on every client socket (`TCP_NODELAY`, keepalive, `TCP_USER_TIMEOUT`). |
 | `player.c` | The `Player` object shared between threads, and `player_send()` (one writer at a time per socket). |
 | `lobby.c` | Matchmaking queue: one waiting slot, first come, first served. |
-| `game.c` | Matches: creation, the match thread, and how a match ends. Owns `game_lock`. |
+| `game.c` | Matches: creation, the match thread (game loop and physics), and how a match ends. Owns `game_lock`. |
+
+**Game loop (authoritative server).** Each match thread runs a fixed-timestep loop at 30 ticks/s:
+take a snapshot of both players' last `INPUT` (under `game_lock`) → move the paddles (fixed speed, clamped
+to the field) → move the ball, bounce it on the walls and paddles (the bounce angle depends on where it
+hits the paddle, and every hit makes it 6% faster, up to a limit that keeps it from skipping over a
+paddle) → detect goals → send `STATE` to both players. Ticks are scheduled on absolute deadlines
+(`clock_nanosleep` with `TIMER_ABSTIME`), so the time spent simulating and sending never makes the game
+drift slower. Clients only send *intentions* (up / down / stop), never positions. That is how the server
+validates every move: a client simply cannot place its paddle or the ball anywhere. After each goal, the
+ball waits ~0.7 s in the centre and is served toward the player who conceded.
 | `logger.c` | Thread-safe logger (see 2.4). |
 
 **Shared state and synchronization.** Several threads work on the same player: its own client thread,
@@ -226,7 +236,9 @@ Both applications use these fixed values. They are part of the specification and
 | Winning score | 5 |
 
 Positions are integers, so we never have to serialize floating-point numbers. The server is free to
-simulate internally with more precision.
+simulate internally with more precision. `ball_y` is always in 0–590 and the paddles in 0–520. `ball_x`
+is normally in 0–790, but when the ball leaves the field after a goal it may briefly be partly outside:
+values up to 800 are sent, and negative values are sent as 0.
 
 #### 2.3.7 Procedure rules
 
@@ -364,7 +376,15 @@ For every client message the server logs the raw bytes in hexadecimal (`RECV <TY
 it decoded, then what it answered (`SEND <TYPE>`). The hex can be compared byte by byte with the spec in
 2.3.9 or with `tcpdump`. Text fields (nickname, e-mail) are written to the log only after they pass
 validation, so a client cannot inject fake lines into the log with line breaks or control characters.
-High-frequency messages (`STATE`) are not logged.
+High-frequency messages (`STATE`) are not logged. Instead, the log tells the story of every match:
+
+```
+2026-10-20 23:40:47 [INFO] match started: 'left1' (left, 127.0.0.1:44906) vs 'right1' (right, 127.0.0.1:44920)
+2026-10-20 23:40:53 [INFO] goal: 'left1' scores (1-0) in 'left1' vs 'right1'
+2026-10-20 23:41:13 [INFO] goal: 'right1' scores (3-1) in 'left1' vs 'right1'
+2026-10-20 23:41:37 [INFO] goal: 'left1' scores (5-2) in 'left1' vs 'right1'
+2026-10-20 23:41:37 [INFO] match 'left1' vs 'right1' over: winner=left1 (score)
+```
 
 ```
 2026-10-11 17:26:35 [INFO] 127.0.0.1:36974 connected
@@ -387,15 +407,20 @@ make
 ./server <PORT> <LogFile>      # e.g. ./server 5000 pong.log
 ```
 
-**Test bot** (Python 3, standard library only; the pygame client arrives in Phase 7):
+**Test bot** (Python 3, standard library only, no window):
 
 ```bash
 cd client
 python bot.py --nick ana                        # register, print the server's reply, send QUIT
 python bot.py --nick ana --hold 20              # stay registered for 20 s before QUIT
 python bot.py --nick ana --join --hold 30       # JOIN the queue and print what arrives for 30 s
+python bot.py --nick ana --play                 # JOIN and play a whole match automatically
 python bot.py --nick ana --host 1.2.3.4 --port 5000 --email ana@x.co
 ```
+
+With `--play`, the bot moves its paddle toward the ball (with a random aiming error, so goals happen),
+sends `INPUT` only when its direction changes, and leaves after `GAME_OVER`. Two `--play` bots play a
+whole match in about a minute. The test campaign used 20 bots at once (10 simultaneous matches).
 
 Run `bot.py --nick ana --hold 20` and, meanwhile, a second `bot.py --nick ANA`: the second one receives
 `ERROR code=3 (NICK_TAKEN)`.
