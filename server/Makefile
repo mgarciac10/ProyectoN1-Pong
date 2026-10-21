@@ -10,7 +10,7 @@ LDFLAGS = -pthread
 TARGET  = server
 SRCS    = main.c logger.c protocol.c sockopts.c session.c player.c lobby.c game.c
 OBJS    = $(SRCS:.c=.o)
-HDRS    = logger.h protocol.h sockopts.h session.h player.h lobby.h game.h
+HDRS    = logger.h protocol.h sockopts.h session.h player.h lobby.h game.h server.h
 
 all: $(TARGET)
 

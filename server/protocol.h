@@ -33,11 +33,14 @@ typedef enum {
     MSG_JOIN        = 0x02,
     MSG_INPUT       = 0x03,
     MSG_QUIT        = 0x04,
+    MSG_LIST        = 0x05,
+    MSG_PLAY_WITH   = 0x06,
     MSG_REGISTER_OK = 0x81,
     MSG_WAITING     = 0x82,
     MSG_MATCH_START = 0x83,
     MSG_STATE       = 0x84,
     MSG_GAME_OVER   = 0x85,
+    MSG_USER_LIST   = 0x86,
     MSG_ERROR       = 0xFF
 } MsgType;
 
@@ -47,7 +50,8 @@ typedef enum {
     ERR_BAD_MESSAGE   = 2,
     ERR_NICK_TAKEN    = 3,
     ERR_INVALID_STATE = 4,
-    ERR_INVALID_FIELD = 5
+    ERR_INVALID_FIELD = 5,
+    ERR_USER_NOT_AVAILABLE = 6
 } ErrorCode;
 
 /* The 4-byte header, already converted to host byte order. */
@@ -106,6 +110,12 @@ DecodeStatus proto_decode_register(const uint8_t *payload, size_t len,
                                    char *nick, char *email, const char **why);
 
 /* ---- Helpers for logging ---- */
+
+/*
+ * Decodes a PLAY_WITH payload: nick_len:u8, nick. The header's length must be
+ * exactly 1 + nick_len. `nick` needs NICK_MAX + 1 bytes (comes back NUL-terminated).
+ */
+DecodeStatus proto_decode_nick(const uint8_t *payload, size_t len, char *nick, const char **why);
 
 int         proto_is_client_type(uint8_t type);
 const char *proto_type_name(uint8_t type);

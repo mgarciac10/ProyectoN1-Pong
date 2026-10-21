@@ -18,6 +18,7 @@
 #include <unistd.h>      /* close */
 
 #include "logger.h"
+#include "server.h"
 #include "session.h"
 #include "sockopts.h"
 
@@ -25,9 +26,28 @@
 
 /* Everything a client thread needs to know about its client. */
 typedef struct {
-    int  fd;             /* connection socket returned by accept() */
-    char addr[32];       /* "ip:port", used in every log line */
+    Server *srv;         /* shared server context */
+    int     fd;          /* connection socket returned by accept() */
+    char    addr[32];    /* "ip:port", used in every log line */
 } Client;
+
+/* Prepares the shared server context (see server.h). 0 on success, -1 on error. */
+static int server_init(Server *srv, const char *log_path)
+{
+    memset(srv, 0, sizeof *srv);
+    pthread_mutex_init(&srv->nicks_lock, NULL);
+    pthread_mutex_init(&srv->game_lock, NULL);
+    pthread_cond_init(&srv->players_released, NULL);
+    return logger_init(&srv->log, log_path);
+}
+
+static void server_destroy(Server *srv)
+{
+    logger_close(&srv->log);
+    pthread_cond_destroy(&srv->players_released);
+    pthread_mutex_destroy(&srv->game_lock);
+    pthread_mutex_destroy(&srv->nicks_lock);
+}
 
 static void print_usage(const char *prog)
 {
@@ -38,13 +58,13 @@ static void print_usage(const char *prog)
  * Creates a TCP socket listening on 0.0.0.0:<port>.
  * Returns the listening file descriptor, or -1 on error.
  */
-static int create_listen_socket(uint16_t port)
+static int create_listen_socket(Logger *lg, uint16_t port)
 {
     /* 1. socket(): ask the OS for an IPv4 (AF_INET) TCP (SOCK_STREAM) endpoint.
      *    Like open() for files, it returns a file descriptor (a small int). */
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
-        log_event(LOG_ERROR, "socket: %s", strerror(errno));
+        log_event(lg, LOG_ERROR, "socket: %s", strerror(errno));
         return -1;
     }
 
@@ -53,7 +73,7 @@ static int create_listen_socket(uint16_t port)
      * (old connections linger in the TIME_WAIT state). */
     int yes = 1;
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes) < 0) {
-        log_event(LOG_ERROR, "setsockopt: %s", strerror(errno));
+        log_event(lg, LOG_ERROR, "setsockopt: %s", strerror(errno));
         close(fd);
         return -1;
     }
@@ -66,7 +86,7 @@ static int create_listen_socket(uint16_t port)
     addr.sin_port        = htons(port);       /* host -> network byte order */
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
-        log_event(LOG_ERROR, "bind: %s", strerror(errno));
+        log_event(lg, LOG_ERROR, "bind: %s", strerror(errno));
         close(fd);
         return -1;
     }
@@ -74,7 +94,7 @@ static int create_listen_socket(uint16_t port)
     /* 3. listen(): turn it into a passive socket. From now on the KERNEL
      *    completes incoming connections and queues them (up to BACKLOG). */
     if (listen(fd, BACKLOG) < 0) {
-        log_event(LOG_ERROR, "listen: %s", strerror(errno));
+        log_event(lg, LOG_ERROR, "listen: %s", strerror(errno));
         close(fd);
         return -1;
     }
@@ -89,11 +109,11 @@ static void *client_thread(void *arg)
 {
     Client *client = arg; /* void* -> Client*: we know what we passed in */
 
-    configure_client_socket(client->fd, client->addr);
-    session_run(client->fd, client->addr);
+    configure_client_socket(&client->srv->log, client->fd, client->addr);
+    session_run(client->srv, client->fd, client->addr);
 
     close(client->fd);
-    log_event(LOG_INFO, "%s disconnected", client->addr);
+    log_event(&client->srv->log, LOG_INFO, "%s disconnected", client->addr);
     free(client); /* the thread owns the Client: it was malloc'ed in main() */
     return NULL;
 }
@@ -118,7 +138,11 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    if (logger_init(argv[2]) < 0)
+    /* All the state shared between threads lives here, NOT in global variables.
+     * It is on main()'s stack, which is safe because main() never returns while
+     * client threads are running (the accept loop below is infinite). */
+    Server srv;
+    if (server_init(&srv, argv[2]) < 0)
         return EXIT_FAILURE;
 
     /* By default, send() on a connection the peer already closed raises
@@ -126,13 +150,13 @@ int main(int argc, char *argv[])
      * makes send() just return -1 with errno = EPIPE, which we handle. */
     signal(SIGPIPE, SIG_IGN);
 
-    int listen_fd = create_listen_socket((uint16_t)port);
+    int listen_fd = create_listen_socket(&srv.log, (uint16_t)port);
     if (listen_fd < 0) {
-        logger_close();
+        server_destroy(&srv);
         return EXIT_FAILURE;
     }
 
-    log_event(LOG_INFO, "PongServer listening on port %ld (log file: %s)", port, argv[2]);
+    log_event(&srv.log, LOG_INFO, "PongServer listening on port %ld (log file: %s)", port, argv[2]);
 
     /* The main thread only accepts; each client gets its own thread. */
     for (;;) {
@@ -145,7 +169,7 @@ int main(int argc, char *argv[])
         int client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &addr_len);
         if (client_fd < 0) {
             if (errno != EINTR)
-                log_event(LOG_ERROR, "accept: %s", strerror(errno));
+                log_event(&srv.log, LOG_ERROR, "accept: %s", strerror(errno));
             continue;
         }
 
@@ -153,23 +177,24 @@ int main(int argc, char *argv[])
          * iteration, because the new thread keeps using it. */
         Client *client = malloc(sizeof *client);
         if (client == NULL) {
-            log_event(LOG_ERROR, "malloc failed, dropping connection");
+            log_event(&srv.log, LOG_ERROR, "malloc failed, dropping connection");
             close(client_fd);
             continue;
         }
-        client->fd = client_fd;
+        client->srv = &srv;
+        client->fd  = client_fd;
 
         char ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof ip);
         snprintf(client->addr, sizeof client->addr, "%s:%d", ip, ntohs(client_addr.sin_port));
 
-        log_event(LOG_INFO, "%s connected", client->addr);
+        log_event(&srv.log, LOG_INFO, "%s connected", client->addr);
 
         /* 5. Start a thread running client_thread(client). */
         pthread_t tid;
         int err = pthread_create(&tid, NULL, client_thread, client);
         if (err != 0) {
-            log_event(LOG_ERROR, "pthread_create: %s", strerror(err));
+            log_event(&srv.log, LOG_ERROR, "pthread_create: %s", strerror(err));
             close(client_fd);
             free(client);
             continue;
@@ -182,6 +207,6 @@ int main(int argc, char *argv[])
 
     /* Not reached for now; a clean shutdown comes in a later phase. */
     close(listen_fd);
-    logger_close();
+    server_destroy(&srv);
     return EXIT_SUCCESS;
 }

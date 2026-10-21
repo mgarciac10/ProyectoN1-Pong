@@ -9,7 +9,7 @@
  * lobby, and the match itself by its own thread (game.c). INPUT is forwarded to the match (game_set_input).
  *
  * The player's state is shared with other threads (the lobby and the match
- * thread change it), so it is always read and written under game_lock.
+ * thread change it), so it is always read and written under srv->game_lock.
  */
 #include "session.h"
 
@@ -41,19 +41,16 @@
 typedef struct NickNode {
     char             nick[NICK_MAX + 1];
     struct NickNode *next;
-} NickNode;
-
-static NickNode        *registry_head = NULL;
-static pthread_mutex_t  registry_lock = PTHREAD_MUTEX_INITIALIZER;
+} NickNode;   /* the list head and its lock live in the Server context (server.h) */
 
 typedef enum { REG_OK, REG_TAKEN, REG_NO_MEMORY } RegResult;
 
-static RegResult registry_add(const char *nick)
+static RegResult registry_add(Server *srv, const char *nick)
 {
     RegResult result = REG_OK;
 
-    pthread_mutex_lock(&registry_lock);
-    for (NickNode *n = registry_head; n != NULL; n = n->next) {
+    pthread_mutex_lock(&srv->nicks_lock);
+    for (NickNode *n = srv->nicks; n != NULL; n = n->next) {
         if (strcasecmp(n->nick, nick) == 0) {
             result = REG_TAKEN;
             break;
@@ -65,18 +62,18 @@ static RegResult registry_add(const char *nick)
             result = REG_NO_MEMORY;
         } else {
             snprintf(node->nick, sizeof node->nick, "%s", nick);
-            node->next = registry_head;
-            registry_head = node;
+            node->next = srv->nicks;
+            srv->nicks = node;
         }
     }
-    pthread_mutex_unlock(&registry_lock);
+    pthread_mutex_unlock(&srv->nicks_lock);
     return result;
 }
 
-static void registry_remove(const char *nick)
+static void registry_remove(Server *srv, const char *nick)
 {
-    pthread_mutex_lock(&registry_lock);
-    NickNode **link = &registry_head;      /* pointer to the pointer that points to n */
+    pthread_mutex_lock(&srv->nicks_lock);
+    NickNode **link = &srv->nicks;          /* pointer to the pointer that points to n */
     while (*link != NULL) {
         if (strcasecmp((*link)->nick, nick) == 0) {
             NickNode *dead = *link;
@@ -86,7 +83,7 @@ static void registry_remove(const char *nick)
         }
         link = &(*link)->next;
     }
-    pthread_mutex_unlock(&registry_lock);
+    pthread_mutex_unlock(&srv->nicks_lock);
 }
 
 /* ================================================================ session data */
@@ -97,9 +94,9 @@ typedef enum { ACTION_KEEP, ACTION_CLOSE } Action;
 /* The player's state, read under game_lock (other threads may change it). */
 static PlayerState current_state(Player *s)
 {
-    pthread_mutex_lock(&game_lock);
+    pthread_mutex_lock(&s->srv->game_lock);
     PlayerState st = s->state;
-    pthread_mutex_unlock(&game_lock);
+    pthread_mutex_unlock(&s->srv->game_lock);
     return st;
 }
 
@@ -108,8 +105,8 @@ static int allowed_in_state(PlayerState st, uint8_t type)
 {
     switch (st) {
     case ST_CONNECTED:  return type == MSG_REGISTER || type == MSG_QUIT;
-    case ST_REGISTERED: return type == MSG_JOIN     || type == MSG_QUIT;
-    case ST_WAITING:    return type == MSG_QUIT;
+    case ST_REGISTERED: return type == MSG_JOIN || type == MSG_LIST || type == MSG_PLAY_WITH || type == MSG_QUIT;
+    case ST_WAITING:    return type == MSG_LIST || type == MSG_PLAY_WITH || type == MSG_QUIT;
     case ST_PLAYING:    return type == MSG_INPUT    || type == MSG_QUIT;
     }
     return 0;
@@ -124,7 +121,7 @@ static int send_empty(Player *s, MsgType type)
 {
     if (player_send(s, type, NULL, 0) < 0)
         return -1;
-    log_event(LOG_INFO, "%s SEND %s", s->peer, proto_type_name(type));
+    log_event(&s->srv->log, LOG_INFO, "%s SEND %s", s->peer, proto_type_name(type));
     return 0;
 }
 
@@ -133,7 +130,7 @@ static int send_error(Player *s, ErrorCode code)
     uint8_t payload[1] = { (uint8_t)code };
     if (player_send(s, MSG_ERROR, payload, sizeof payload) < 0)
         return -1;
-    log_event(LOG_INFO, "%s SEND ERROR code=%d (%s)", s->peer, (int)code, proto_error_name((uint8_t)code));
+    log_event(&s->srv->log, LOG_INFO, "%s SEND ERROR code=%d (%s)", s->peer, (int)code, proto_error_name((uint8_t)code));
     return 0;
 }
 
@@ -144,7 +141,7 @@ static int send_error(Player *s, ErrorCode code)
  */
 static Action reply_error(Player *s, ErrorCode code, const char *why)
 {
-    log_event(LOG_WARN, "%s rejected: %s", s->peer, why);
+    log_event(&s->srv->log, LOG_WARN, "%s rejected: %s", s->peer, why);
     int send_failed = send_error(s, code) < 0;
     int fatal = (code == ERR_BAD_VERSION || code == ERR_BAD_MESSAGE);
     return (send_failed || fatal) ? ACTION_CLOSE : ACTION_KEEP;
@@ -191,25 +188,25 @@ static Action handle_register(Player *s, const ProtoHeader *hdr, const uint8_t *
 
     /* The fields passed validation, so it is safe to write them in the log
      * (a nick has only letters/digits/_/-; an e-mail only printable ASCII). */
-    log_event(LOG_INFO, "%s REGISTER nick=%s email=%s", s->peer, nick, email);
+    log_event(&s->srv->log, LOG_INFO, "%s REGISTER nick=%s email=%s", s->peer, nick, email);
 
-    RegResult r = registry_add(nick);
+    RegResult r = registry_add(s->srv, nick);
     if (r == REG_TAKEN) {
         char msg[64];
         snprintf(msg, sizeof msg, "nickname '%s' is already in use", nick);
         return reply_error(s, ERR_NICK_TAKEN, msg);
     }
     if (r == REG_NO_MEMORY) {
-        log_event(LOG_ERROR, "%s out of memory while registering", s->peer);
+        log_event(&s->srv->log, LOG_ERROR, "%s out of memory while registering", s->peer);
         return ACTION_CLOSE;
     }
 
     snprintf(s->nick, sizeof s->nick, "%s", nick);
     snprintf(s->email, sizeof s->email, "%s", email);
-    pthread_mutex_lock(&game_lock);
+    pthread_mutex_lock(&s->srv->game_lock);
     s->state = ST_REGISTERED;
-    pthread_mutex_unlock(&game_lock);
-    log_event(LOG_INFO, "%s registered as '%s'", s->peer, s->nick);
+    pthread_mutex_unlock(&s->srv->game_lock);
+    log_event(&s->srv->log, LOG_INFO, "%s registered as '%s'", s->peer, s->nick);
 
     return send_empty(s, MSG_REGISTER_OK) < 0 ? ACTION_CLOSE : ACTION_KEEP;
 }
@@ -219,13 +216,68 @@ static Action handle_join(Player *s, const ProtoHeader *hdr)
     if (hdr->length != 0)
         return reply_error(s, ERR_BAD_MESSAGE, "JOIN must have an empty payload");
 
-    /* The lobby answers: WAITING now, or MATCH_START (sent by the new match
-     * thread) if somebody was already waiting. */
-    pthread_mutex_lock(&game_lock);
+    /* The player becomes available: it enters the list and receives WAITING.
+     * It stays there until somebody chooses it (PLAY_WITH) or it leaves. */
+    pthread_mutex_lock(&s->srv->game_lock);
     if (s->state == ST_REGISTERED)
         lobby_join(s);
-    pthread_mutex_unlock(&game_lock);
+    pthread_mutex_unlock(&s->srv->game_lock);
     return ACTION_KEEP;
+}
+
+/* LIST: answer with USER_LIST, the players available right now (except me). */
+static Action handle_list(Player *s, const ProtoHeader *hdr)
+{
+    if (hdr->length != 0)
+        return reply_error(s, ERR_BAD_MESSAGE, "LIST must have an empty payload");
+
+    uint8_t payload[PROTO_MAX_PAYLOAD];
+
+    /* Built and sent while game_lock is held, like WAITING: a MATCH_START can
+     * never overtake it, and the list is a consistent snapshot. If somebody
+     * chose us meanwhile (we are PLAYING now), the LIST is simply ignored. */
+    pthread_mutex_lock(&s->srv->game_lock);
+    if (s->state == ST_REGISTERED || s->state == ST_WAITING) {
+        size_t len = lobby_list(s, payload, sizeof payload);
+        if (player_send(s, MSG_USER_LIST, payload, len) == 0)
+            log_event(&s->srv->log, LOG_INFO, "%s SEND USER_LIST (%u available)", s->peer, (unsigned)payload[0]);
+    }
+    pthread_mutex_unlock(&s->srv->game_lock);
+    return ACTION_KEEP;
+}
+
+/* PLAY_WITH(nick): start a match against an available player. */
+static Action handle_play_with(Player *s, const ProtoHeader *hdr, const uint8_t *payload)
+{
+    char nick[NICK_MAX + 1];
+    const char *why = "";
+
+    DecodeStatus ds = proto_decode_nick(payload, hdr->length, nick, &why);
+    if (ds == DECODE_BAD_LAYOUT)
+        return reply_error(s, ERR_BAD_MESSAGE, why);
+    if (ds == DECODE_BAD_FIELD)
+        return reply_error(s, ERR_INVALID_FIELD, why);
+
+    log_event(&s->srv->log, LOG_INFO, "%s PLAY_WITH nick=%s", s->peer, nick);
+
+    /* Look up + remove from the list + create the match: ONE step under the
+     * lock, so two players can never choose the same opponent at once. */
+    pthread_mutex_lock(&s->srv->game_lock);
+    ErrorCode err = 0;
+    if (s->state == ST_PLAYING)
+        err = ERR_INVALID_STATE;             /* somebody chose us meanwhile */
+    else if (lobby_play_with(s, nick) < 0)
+        err = ERR_USER_NOT_AVAILABLE;
+    pthread_mutex_unlock(&s->srv->game_lock);
+
+    if (err == ERR_INVALID_STATE)
+        return reply_error(s, err, "PLAY_WITH crossed a MATCH_START (already playing)");
+    if (err == ERR_USER_NOT_AVAILABLE) {
+        char msg[64];
+        snprintf(msg, sizeof msg, "'%s' is not available", nick);
+        return reply_error(s, err, msg);
+    }
+    return ACTION_KEEP;                      /* MATCH_START comes from the match thread */
 }
 
 /* INPUT (README 2.3.4): one byte, dir = 0 stop / 1 up / 2 down. Only reached in
@@ -246,7 +298,7 @@ static Action handle_quit(Player *s, const ProtoHeader *hdr)
     if (hdr->length != 0)
         return reply_error(s, ERR_BAD_MESSAGE, "QUIT must have an empty payload");
 
-    log_event(LOG_INFO, "%s QUIT", s->peer);
+    log_event(&s->srv->log, LOG_INFO, "%s QUIT", s->peer);
     return ACTION_CLOSE;
 }
 
@@ -259,14 +311,14 @@ static Action handle_message(Player *s, const ProtoHeader *hdr, const uint8_t *p
 {
     char hex[128];
     proto_format_frame(hdr, payload, hex, sizeof hex);
-    log_event(LOG_INFO, "%s RECV %s [%s]", s->peer, proto_type_name(hdr->type), hex);
+    log_event(&s->srv->log, LOG_INFO, "%s RECV %s [%s]", s->peer, proto_type_name(hdr->type), hex);
 
     PlayerState st = current_state(s);
 
     /* README rule 7: a late INPUT is silently discarded, never answered with an
      * error (it may legitimately cross a GAME_OVER already on its way). */
     if (hdr->type == MSG_INPUT && st != ST_PLAYING) {
-        log_event(LOG_INFO, "%s INPUT ignored (state %s)", s->peer, player_state_name(st));
+        log_event(&s->srv->log, LOG_INFO, "%s INPUT ignored (state %s)", s->peer, player_state_name(st));
         return ACTION_KEEP;
     }
 
@@ -278,23 +330,25 @@ static Action handle_message(Player *s, const ProtoHeader *hdr, const uint8_t *p
     }
 
     switch (hdr->type) {
-    case MSG_REGISTER: return handle_register(s, hdr, payload);
-    case MSG_JOIN:     return handle_join(s, hdr);
-    case MSG_INPUT:    return handle_input(s, hdr, payload);
-    case MSG_QUIT:     return handle_quit(s, hdr);
-    default:           return ACTION_KEEP;   /* proto_recv only lets client types through */
+    case MSG_REGISTER:  return handle_register(s, hdr, payload);
+    case MSG_JOIN:      return handle_join(s, hdr);
+    case MSG_LIST:      return handle_list(s, hdr);
+    case MSG_PLAY_WITH: return handle_play_with(s, hdr, payload);
+    case MSG_INPUT:     return handle_input(s, hdr, payload);
+    case MSG_QUIT:      return handle_quit(s, hdr);
+    default:            return ACTION_KEEP;   /* proto_recv only lets client types through */
     }
 }
 
 /* ================================================================== main loop */
 
-void session_run(int fd, const char *peer)
+void session_run(Server *srv, int fd, const char *peer)
 {
     /* The Player lives on this thread's stack. That is safe even though other
      * threads use it: game_player_leave() below does not return until no match
      * references it any more. */
     Player s;
-    player_init(&s, fd, peer);
+    player_init(&s, srv, fd, peer);
 
     int server_closes = 0;   /* did WE decide to end the connection? */
 
@@ -313,12 +367,12 @@ void session_run(int fd, const char *peer)
             continue;
         }
         if (st == PROTO_CLOSED) {
-            log_event(LOG_INFO, "%s closed the connection", peer);
+            log_event(&srv->log, LOG_INFO, "%s closed the connection", peer);
             break;
         }
         if (st == PROTO_IO_ERROR) {
             /* Also what we see when keepalive / TCP_USER_TIMEOUT declare a client dead. */
-            log_event(LOG_ERROR, "%s recv: %s", peer, strerror(errno));
+            log_event(&srv->log, LOG_ERROR, "%s recv: %s", peer, strerror(errno));
             break;
         }
 
@@ -346,8 +400,8 @@ void session_run(int fd, const char *peer)
      * left. Do it BEFORE lingering_close(), which may wait up to ~3 s: the player
      * is already gone for the protocol, so its nick must be free right away. */
     if (s.nick[0] != '\0') {   /* set only after a successful REGISTER */
-        registry_remove(s.nick);
-        log_event(LOG_INFO, "%s nickname '%s' released", peer, s.nick);
+        registry_remove(srv, s.nick);
+        log_event(&srv->log, LOG_INFO, "%s nickname '%s' released", peer, s.nick);
     }
 
     if (server_closes)

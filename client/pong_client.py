@@ -4,9 +4,10 @@ Usage:
     python pong_client.py [--host HOST] [--port PORT] [--nick NICK] [--email EMAIL]
 
 Registration happens in the console (it asks for the nickname and e-mail if
-they are not given), then the game window opens:
-    J = join a match (and play again after a match)   Q / Esc = quit
-    Up / Down (or W / S) = move your paddle
+they are not given), then the game window opens. The menu shows the players
+that are available right now (refreshed every 1.5 s):
+    1-9 = play against that player     J = become available (others can choose you)
+    Up / Down (or W / S) = move your paddle      Q / Esc = quit
 
 Design:
   * A RECEIVER THREAD blocks on recv_msg() and puts every message in a queue.
@@ -21,12 +22,14 @@ import queue
 import socket
 import sys
 import threading
+import time
 
 import pygame
 
 import protocol
 
 FPS = 60
+LIST_EVERY = 1.5            # seconds between LIST requests while in the menu
 BG = (15, 15, 25)
 FG = (230, 230, 230)
 MINE = (90, 200, 255)       # colour of the player's own paddle
@@ -84,11 +87,15 @@ class PongClient:
         self.sock = sock
         self.nick = nick
         self.inbox = queue.Queue()
-        self.screen = None   # "menu", "waiting", "playing", "over", "disconnected"
+        self.screen = None   # "menu", "waiting", "playing", "disconnected"
         self.side = 0
         self.opponent = ""
         self.state = None    # last STATE: (ball_x, ball_y, left_y, right_y, score_l, score_r)
-        self.result = ""
+        self.result = ""     # result of the last match, shown in the menu
+        self.available = []  # nicks from the last USER_LIST
+        self.status = ""     # short message (e.g. "bob is no longer available")
+        self.status_until = 0.0
+        self.last_list = 0.0
         self.current_dir = protocol.DIR_STOP
         self.held = set()    # keys held down (tracked from KEYDOWN / KEYUP events)
 
@@ -107,6 +114,8 @@ class PongClient:
         msg_type, payload = msg
         if msg_type == protocol.MSG_WAITING:
             self.screen = "waiting"
+        elif msg_type == protocol.MSG_USER_LIST:
+            self.available = protocol.decode_user_list(payload)
         elif msg_type == protocol.MSG_MATCH_START:
             self.side, self.opponent = protocol.decode_match_start(payload)
             self.state = None
@@ -123,9 +132,15 @@ class PongClient:
                 self.result = "You win!" if won else "%s wins." % self.opponent
                 if self.state:   # the last STATE carries the final score
                     self.result += "  (%d-%d)" % (self.state[4], self.state[5])
-            self.screen = "over"    # back to REGISTERED on the server: J plays again
+            self.screen = "menu"    # back to REGISTERED on the server: choose again
+            self.last_list = 0.0    # refresh the list right away
         elif msg_type == protocol.MSG_ERROR:
+            if payload and payload[0] == protocol.ERR_USER_NOT_AVAILABLE:
+                self.show_status("That player is no longer available")
             print("Server: " + protocol.describe(msg_type, payload))
+
+    def show_status(self, text, seconds=3.0):
+        self.status, self.status_until = text, time.time() + seconds
 
     # ----- keyboard
 
@@ -141,9 +156,14 @@ class PongClient:
     def on_key(self, key):
         if key in (pygame.K_q, pygame.K_ESCAPE):
             return False
-        if key == pygame.K_j and self.screen in ("menu", "over"):
-            self.send(protocol.MSG_JOIN)
-            self.screen = "waiting"   # the server answers WAITING or MATCH_START
+        if key == pygame.K_j and self.screen == "menu":
+            self.send(protocol.MSG_JOIN)          # the server answers WAITING
+        elif pygame.K_1 <= key <= pygame.K_9 and self.screen in ("menu", "waiting"):
+            i = key - pygame.K_1
+            if i < len(self.available):
+                nick = self.available[i]
+                self.send(protocol.MSG_PLAY_WITH, protocol.encode_nick(nick))
+                self.show_status("Asking to play against %s..." % nick)
         return True
 
     # ----- drawing
@@ -167,19 +187,24 @@ class PongClient:
             self.text(surface, small, "%s  vs  %s" % names, 70, DIM)
         elif self.screen == "playing":
             self.text(surface, big, "Match vs %s" % self.opponent, 250)
-        elif self.screen == "waiting":
-            self.text(surface, big, "Waiting for an opponent...", 250)
-            self.text(surface, small, "Q = quit", 320, DIM)
-        elif self.screen == "over":
-            self.text(surface, big, self.result, 230)
-            self.text(surface, small, "J = play again     Q = quit", 300, DIM)
         elif self.screen == "disconnected":
             self.text(surface, big, "Connection to the server lost", 250)
             self.text(surface, small, "Q = close", 320, DIM)
-        else:  # menu
-            self.text(surface, big, "PONG", 200)
-            self.text(surface, small, "Registered as '%s'" % self.nick, 270, DIM)
-            self.text(surface, small, "J = join a match     Q = quit", 310, DIM)
+        else:  # menu or waiting: the list of available players
+            self.text(surface, big, self.result or "PONG", 60)
+            if self.screen == "waiting":
+                self.text(surface, small, "You are available: waiting for someone to choose you...", 130, MINE)
+            else:
+                self.text(surface, small, "Registered as '%s'" % self.nick, 130, DIM)
+            self.text(surface, small, "Available players:", 190)
+            if not self.available:
+                self.text(surface, small, "(nobody right now)", 230, DIM)
+            for i, nick in enumerate(self.available[:9]):
+                self.text(surface, small, "%d.  %s" % (i + 1, nick), 230 + 34 * i)
+            keys = "1-9 = play against     Q = quit" if self.screen == "waiting" else                    "1-9 = play against     J = be available     Q = quit"
+            self.text(surface, small, keys, 550, DIM)
+        if self.status and time.time() < self.status_until:
+            self.text(surface, small, self.status, 510, MINE)
         pygame.display.flip()
 
     # ----- main loop
@@ -208,6 +233,11 @@ class PongClient:
 
             while not self.inbox.empty():
                 self.handle(self.inbox.get())
+
+            # The list of available players changes all the time: ask again regularly.
+            if self.screen in ("menu", "waiting") and time.time() - self.last_list > LIST_EVERY:
+                self.send(protocol.MSG_LIST)
+                self.last_list = time.time()
 
             # README rule 4: INPUT only when the direction changes, not every frame.
             if self.screen == "playing":

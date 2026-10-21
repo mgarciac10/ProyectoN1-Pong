@@ -47,13 +47,8 @@
 #define REASON_SCORE         0
 #define REASON_OPPONENT_LEFT 1
 
-pthread_mutex_t game_lock = PTHREAD_MUTEX_INITIALIZER;
-
-/* Signalled every time a match drops its references to its players
- * (a leaving client thread waits on it in game_player_leave). */
-static pthread_cond_t players_released = PTHREAD_COND_INITIALIZER;
-
 typedef struct Match {
+    Server *srv;       /* shared server context (game_lock, logger...) */
     Player *p[2];      /* p[0] = left, p[1] = right. Fixed after creation. */
     int     gone[2];   /* [game_lock] 1 once that player quit or disconnected */
     int     dir[2];    /* [game_lock] last INPUT of each player: 0 stop, 1 up, 2 down */
@@ -82,14 +77,14 @@ static void send_match_start(Match *m, int side)
     memcpy(payload + 2, opp->nick, n);
 
     if (player_send(me, MSG_MATCH_START, payload, 2 + n) == 0)
-        log_event(LOG_INFO, "%s SEND MATCH_START side=%d opponent=%s", me->peer, side, opp->nick);
+        log_event(&me->srv->log, LOG_INFO, "%s SEND MATCH_START side=%d opponent=%s", me->peer, side, opp->nick);
 }
 
 static void send_game_over(Player *p, int winner, int reason)
 {
     uint8_t payload[2] = { (uint8_t)winner, (uint8_t)reason };
     if (player_send(p, MSG_GAME_OVER, payload, sizeof payload) == 0)
-        log_event(LOG_INFO, "%s SEND GAME_OVER winner=%d reason=%d (%s)", p->peer, winner, reason,
+        log_event(&p->srv->log, LOG_INFO, "%s SEND GAME_OVER winner=%d reason=%d (%s)", p->peer, winner, reason,
                 reason == REASON_SCORE ? "score" : "opponent left");
 }
 
@@ -183,7 +178,7 @@ static int step_game(Match *m, const int dir[2])
 
     if (scorer >= 0) {
         m->score[scorer]++;
-        log_event(LOG_INFO, "goal: '%s' scores (%d-%d) in '%s' vs '%s'", m->p[scorer]->nick,
+        log_event(&m->srv->log, LOG_INFO, "goal: '%s' scores (%d-%d) in '%s' vs '%s'", m->p[scorer]->nick,
                   m->score[0], m->score[1], m->p[0]->nick, m->p[1]->nick);
         if (m->score[scorer] >= WIN_SCORE)
             return scorer;
@@ -231,7 +226,7 @@ static void match_end(Match *m, int winner, int reason)
 
     /* 1. Back to REGISTERED (they may JOIN again) BEFORE sending GAME_OVER:
      *    a client that reacts to GAME_OVER with JOIN must find the right state. */
-    pthread_mutex_lock(&game_lock);
+    pthread_mutex_lock(&m->srv->game_lock);
     for (int side = 0; side < 2; side++) {
         Player *p = m->p[side];
         notify[side] = !m->gone[side];
@@ -239,9 +234,9 @@ static void match_end(Match *m, int winner, int reason)
         if (notify[side])
             p->state = ST_REGISTERED;
     }
-    pthread_mutex_unlock(&game_lock);
+    pthread_mutex_unlock(&m->srv->game_lock);
 
-    log_event(LOG_INFO, "match '%s' vs '%s' over: winner=%s (%s)", m->p[0]->nick, m->p[1]->nick,
+    log_event(&m->srv->log, LOG_INFO, "match '%s' vs '%s' over: winner=%s (%s)", m->p[0]->nick, m->p[1]->nick,
             m->p[winner]->nick, reason == REASON_SCORE ? "score" : "opponent left");
 
     /* 2. Tell the players who are still connected. They cannot vanish meanwhile:
@@ -251,11 +246,11 @@ static void match_end(Match *m, int winner, int reason)
             send_game_over(m->p[side], winner, reason);
 
     /* 3. Drop our references and wake up any client thread waiting to finish. */
-    pthread_mutex_lock(&game_lock);
+    pthread_mutex_lock(&m->srv->game_lock);
     m->p[0]->refs--;
     m->p[1]->refs--;
-    pthread_cond_broadcast(&players_released);
-    pthread_mutex_unlock(&game_lock);
+    pthread_cond_broadcast(&m->srv->players_released);
+    pthread_mutex_unlock(&m->srv->game_lock);
 
     free(m);
 }
@@ -289,12 +284,12 @@ static void *match_thread(void *arg)
     int dir[2];
     for (;;) {
         /* Take a snapshot of the shared fields; simulate and send OUTSIDE the lock. */
-        pthread_mutex_lock(&game_lock);
+        pthread_mutex_lock(&m->srv->game_lock);
         gone[0] = m->gone[0];
         gone[1] = m->gone[1];
         dir[0]  = m->dir[0];
         dir[1]  = m->dir[1];
-        pthread_mutex_unlock(&game_lock);
+        pthread_mutex_unlock(&m->srv->game_lock);
 
         if (gone[0] || gone[1])
             break;
@@ -334,12 +329,13 @@ void match_create(Player *left, Player *right)
 {
     Match *m = calloc(1, sizeof *m);
     if (m == NULL) {
-        log_event(LOG_ERROR, "out of memory creating a match");
+        log_event(&left->srv->log, LOG_ERROR, "out of memory creating a match");
         abort_pairing(left, right);
         return;
     }
     m->p[0] = left;
     m->p[1] = right;
+    m->srv  = left->srv;
     match_init_game(m);
 
     for (int side = 0; side < 2; side++) {
@@ -353,7 +349,7 @@ void match_create(Player *left, Player *right)
     pthread_t tid;
     int err = pthread_create(&tid, NULL, match_thread, m);
     if (err != 0) {
-        log_event(LOG_ERROR, "pthread_create (match): %s", strerror(err));
+        log_event(&left->srv->log, LOG_ERROR, "pthread_create (match): %s", strerror(err));
         for (int side = 0; side < 2; side++) {
             m->p[side]->match = NULL;
             m->p[side]->refs--;
@@ -363,34 +359,34 @@ void match_create(Player *left, Player *right)
         return;
     }
     pthread_detach(tid);
-    log_event(LOG_INFO, "match started: '%s' (left, %s) vs '%s' (right, %s)",
+    log_event(&left->srv->log, LOG_INFO, "match started: '%s' (left, %s) vs '%s' (right, %s)",
             left->nick, left->peer, right->nick, right->peer);
 }
 
 void game_set_input(Player *p, uint8_t dir)
 {
-    pthread_mutex_lock(&game_lock);
+    pthread_mutex_lock(&p->srv->game_lock);
     if (p->state == ST_PLAYING && p->match != NULL)
         p->match->dir[p->side] = dir;
-    pthread_mutex_unlock(&game_lock);
+    pthread_mutex_unlock(&p->srv->game_lock);
 }
 
 void game_player_leave(Player *p)
 {
-    pthread_mutex_lock(&game_lock);
+    pthread_mutex_lock(&p->srv->game_lock);
 
     if (p->state == ST_WAITING) {
         lobby_cancel(p);
     } else if (p->state == ST_PLAYING && p->match != NULL) {
         /* The match thread notices it on its next tick and ends the match. */
         p->match->gone[p->side] = 1;
-        log_event(LOG_INFO, "%s '%s' left the match", p->peer, p->nick);
+        log_event(&p->srv->log, LOG_INFO, "%s '%s' left the match", p->peer, p->nick);
     }
 
     /* Wait until no match uses p. pthread_cond_wait releases game_lock while
      * sleeping, so the match thread can take it and finish. */
     while (p->refs > 0)
-        pthread_cond_wait(&players_released, &game_lock);
+        pthread_cond_wait(&p->srv->players_released, &p->srv->game_lock);
 
-    pthread_mutex_unlock(&game_lock);
+    pthread_mutex_unlock(&p->srv->game_lock);
 }

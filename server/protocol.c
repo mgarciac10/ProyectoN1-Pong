@@ -163,12 +163,35 @@ DecodeStatus proto_decode_register(const uint8_t *payload, size_t len,
     return DECODE_OK;
 }
 
+DecodeStatus proto_decode_nick(const uint8_t *payload, size_t len, char *nick, const char **why)
+{
+    if (len < 1 || len != 1 + (size_t)payload[0]) {
+        *why = "length does not match nick_len";
+        return DECODE_BAD_LAYOUT;
+    }
+    size_t nick_len = payload[0];
+    if (nick_len < NICK_MIN || nick_len > NICK_MAX) {
+        *why = "nickname length must be 1-16";
+        return DECODE_BAD_FIELD;
+    }
+    for (size_t i = 0; i < nick_len; i++) {
+        if (!is_nick_char(payload[1 + i])) {
+            *why = "nickname may only contain letters, digits, '_' and '-'";
+            return DECODE_BAD_FIELD;
+        }
+    }
+    memcpy(nick, payload + 1, nick_len);
+    nick[nick_len] = '\0';
+    return DECODE_OK;
+}
+
 /* ------------------------------------------------------------------- logging */
 
 int proto_is_client_type(uint8_t type)
 {
-    return type == MSG_REGISTER || type == MSG_JOIN ||
-           type == MSG_INPUT    || type == MSG_QUIT;
+    return type == MSG_REGISTER || type == MSG_JOIN      ||
+           type == MSG_INPUT    || type == MSG_QUIT      ||
+           type == MSG_LIST     || type == MSG_PLAY_WITH;
 }
 
 const char *proto_type_name(uint8_t type)
@@ -178,11 +201,14 @@ const char *proto_type_name(uint8_t type)
     case MSG_JOIN:        return "JOIN";
     case MSG_INPUT:       return "INPUT";
     case MSG_QUIT:        return "QUIT";
+    case MSG_LIST:        return "LIST";
+    case MSG_PLAY_WITH:   return "PLAY_WITH";
     case MSG_REGISTER_OK: return "REGISTER_OK";
     case MSG_WAITING:     return "WAITING";
     case MSG_MATCH_START: return "MATCH_START";
     case MSG_STATE:       return "STATE";
     case MSG_GAME_OVER:   return "GAME_OVER";
+    case MSG_USER_LIST:   return "USER_LIST";
     case MSG_ERROR:       return "ERROR";
     }
     return "UNKNOWN";
@@ -196,6 +222,7 @@ const char *proto_error_name(uint8_t code)
     case ERR_NICK_TAKEN:    return "NICK_TAKEN";
     case ERR_INVALID_STATE: return "INVALID_STATE";
     case ERR_INVALID_FIELD: return "INVALID_FIELD";
+    case ERR_USER_NOT_AVAILABLE: return "USER_NOT_AVAILABLE";
     }
     return "UNKNOWN";
 }

@@ -1,16 +1,7 @@
 #include "logger.h"
 
-#include <pthread.h>
 #include <stdarg.h>   /* va_list: functions with a variable number of arguments */
-#include <stdio.h>
 #include <time.h>
-
-/* "static" globals: shared by every thread, but only visible inside this file. */
-static FILE *log_file = NULL;
-
-/* Only one thread at a time may write a log line. Without this lock, two
- * threads logging at the same moment could interleave their text. */
-static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static const char *level_name(LogLevel level)
 {
@@ -22,25 +13,27 @@ static const char *level_name(LogLevel level)
     return "?";
 }
 
-int logger_init(const char *path)
+int logger_init(Logger *lg, const char *path)
 {
-    log_file = fopen(path, "a"); /* "a" = append: keep previous runs' lines */
-    if (log_file == NULL) {
+    pthread_mutex_init(&lg->lock, NULL);
+    lg->file = fopen(path, "a"); /* "a" = append: keep previous runs' lines */
+    if (lg->file == NULL) {
         perror(path);
         return -1;
     }
     return 0;
 }
 
-void logger_close(void)
+void logger_close(Logger *lg)
 {
-    if (log_file != NULL) {
-        fclose(log_file);
-        log_file = NULL;
+    if (lg->file != NULL) {
+        fclose(lg->file);
+        lg->file = NULL;
     }
+    pthread_mutex_destroy(&lg->lock);
 }
 
-void log_event(LogLevel level, const char *fmt, ...)
+void log_event(Logger *lg, LogLevel level, const char *fmt, ...)
 {
     /* 1. Build the timestamp, e.g. "2026-10-10 14:03:11".
      *    localtime_r is the thread-safe version of localtime. */
@@ -57,14 +50,15 @@ void log_event(LogLevel level, const char *fmt, ...)
     vsnprintf(message, sizeof message, fmt, args);
     va_end(args);
 
-    /* 3. Write the line to both outputs while holding the lock. */
-    pthread_mutex_lock(&log_mutex);
+    /* 3. Write the line to both outputs while holding the lock. Without it,
+     *    two threads logging at the same moment could interleave their text. */
+    pthread_mutex_lock(&lg->lock);
 
     printf("%s [%s] %s\n", timestamp, level_name(level), message);
-    if (log_file != NULL) {
-        fprintf(log_file, "%s [%s] %s\n", timestamp, level_name(level), message);
-        fflush(log_file); /* write it now, so the file is up to date even if we crash */
+    if (lg->file != NULL) {
+        fprintf(lg->file, "%s [%s] %s\n", timestamp, level_name(level), message);
+        fflush(lg->file); /* write it now, so the file is up to date even if we crash */
     }
 
-    pthread_mutex_unlock(&log_mutex);
+    pthread_mutex_unlock(&lg->lock);
 }

@@ -25,11 +25,14 @@ MSG_REGISTER = 0x01
 MSG_JOIN = 0x02
 MSG_INPUT = 0x03
 MSG_QUIT = 0x04
+MSG_LIST = 0x05
+MSG_PLAY_WITH = 0x06
 MSG_REGISTER_OK = 0x81
 MSG_WAITING = 0x82
 MSG_MATCH_START = 0x83
 MSG_STATE = 0x84
 MSG_GAME_OVER = 0x85
+MSG_USER_LIST = 0x86
 MSG_ERROR = 0xFF
 
 # Error codes (payload of MSG_ERROR).
@@ -38,15 +41,18 @@ ERR_BAD_MESSAGE = 2
 ERR_NICK_TAKEN = 3
 ERR_INVALID_STATE = 4
 ERR_INVALID_FIELD = 5
+ERR_USER_NOT_AVAILABLE = 6
 
 TYPE_NAMES = {
     MSG_REGISTER: "REGISTER", MSG_JOIN: "JOIN", MSG_INPUT: "INPUT", MSG_QUIT: "QUIT",
+    MSG_LIST: "LIST", MSG_PLAY_WITH: "PLAY_WITH", MSG_USER_LIST: "USER_LIST",
     MSG_REGISTER_OK: "REGISTER_OK", MSG_WAITING: "WAITING", MSG_MATCH_START: "MATCH_START",
     MSG_STATE: "STATE", MSG_GAME_OVER: "GAME_OVER", MSG_ERROR: "ERROR",
 }
 ERROR_NAMES = {
     ERR_BAD_VERSION: "BAD_VERSION", ERR_BAD_MESSAGE: "BAD_MESSAGE", ERR_NICK_TAKEN: "NICK_TAKEN",
     ERR_INVALID_STATE: "INVALID_STATE", ERR_INVALID_FIELD: "INVALID_FIELD",
+    ERR_USER_NOT_AVAILABLE: "USER_NOT_AVAILABLE",
 }
 
 
@@ -86,6 +92,12 @@ def encode_register(nick, email):
     nick_b = nick.encode("ascii")
     email_b = email.encode("ascii")
     return bytes([len(nick_b)]) + nick_b + bytes([len(email_b)]) + email_b
+
+
+def encode_nick(nick):
+    """PLAY_WITH payload: nick_len:u8, nick (ASCII)."""
+    nick_b = nick.encode("ascii")
+    return bytes([len(nick_b)]) + nick_b
 
 
 def send_msg(sock, msg_type, payload=b""):
@@ -129,6 +141,16 @@ def decode_match_start(payload):
     return side, payload[2:2 + opp_len].decode("ascii")
 
 
+def decode_user_list(payload):
+    """USER_LIST payload: count:u8, then count x (nick_len:u8, nick). Returns a list of nicks."""
+    nicks, pos = [], 1
+    for _ in range(payload[0]):
+        n = payload[pos]
+        nicks.append(payload[pos + 1:pos + 1 + n].decode("ascii"))
+        pos += 1 + n
+    return nicks
+
+
 def decode_state(payload):
     """STATE payload -> (ball_x, ball_y, left_y, right_y, score_l, score_r)."""
     return struct.unpack(STATE_FORMAT, payload)
@@ -151,6 +173,8 @@ def describe(msg_type, payload):
     if msg_type == MSG_MATCH_START and len(payload) >= 2:
         side, opponent = decode_match_start(payload)
         return "MATCH_START side=%d (%s) opponent=%s" % (side, SIDE_NAMES.get(side, "?"), opponent)
+    if msg_type == MSG_USER_LIST and len(payload) >= 1:
+        return "USER_LIST %s" % decode_user_list(payload)
     if msg_type == MSG_GAME_OVER and len(payload) == 2:
         winner, reason = decode_game_over(payload)
         return "GAME_OVER winner=%d (%s) reason=%d (%s)" % (

@@ -17,21 +17,21 @@
 #define KEEPALIVE_PROBES      3       /* unanswered probes before giving up */
 #define USER_TIMEOUT_MS       10000   /* max time with sent data left unacknowledged */
 
-static void set_option(int fd, int level, int name, int value,
+static void set_option(Logger *lg, int fd, int level, int name, int value,
                        const char *label, const char *peer)
 {
     if (setsockopt(fd, level, name, &value, sizeof value) < 0)
-        log_event(LOG_WARN, "%s setsockopt(%s) failed: %s", peer, label, strerror(errno));
+        log_event(lg, LOG_WARN, "%s setsockopt(%s) failed: %s", peer, label, strerror(errno));
 }
 
-void configure_client_socket(int fd, const char *peer)
+void configure_client_socket(Logger *lg, int fd, const char *peer)
 {
-    set_option(fd, IPPROTO_TCP, TCP_NODELAY,      1,                    "TCP_NODELAY",      peer);
+    set_option(lg, fd, IPPROTO_TCP, TCP_NODELAY,      1,                    "TCP_NODELAY",      peer);
 
-    set_option(fd, SOL_SOCKET,  SO_KEEPALIVE,     1,                    "SO_KEEPALIVE",     peer);
-    set_option(fd, IPPROTO_TCP, TCP_KEEPIDLE,     KEEPALIVE_IDLE_S,     "TCP_KEEPIDLE",     peer);
-    set_option(fd, IPPROTO_TCP, TCP_KEEPINTVL,    KEEPALIVE_INTERVAL_S, "TCP_KEEPINTVL",    peer);
-    set_option(fd, IPPROTO_TCP, TCP_KEEPCNT,      KEEPALIVE_PROBES,     "TCP_KEEPCNT",      peer);
+    set_option(lg, fd, SOL_SOCKET,  SO_KEEPALIVE,     1,                    "SO_KEEPALIVE",     peer);
+    set_option(lg, fd, IPPROTO_TCP, TCP_KEEPIDLE,     KEEPALIVE_IDLE_S,     "TCP_KEEPIDLE",     peer);
+    set_option(lg, fd, IPPROTO_TCP, TCP_KEEPINTVL,    KEEPALIVE_INTERVAL_S, "TCP_KEEPINTVL",    peer);
+    set_option(lg, fd, IPPROTO_TCP, TCP_KEEPCNT,      KEEPALIVE_PROBES,     "TCP_KEEPCNT",      peer);
 
-    set_option(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, USER_TIMEOUT_MS,      "TCP_USER_TIMEOUT", peer);
+    set_option(lg, fd, IPPROTO_TCP, TCP_USER_TIMEOUT, USER_TIMEOUT_MS,      "TCP_USER_TIMEOUT", peer);
 }

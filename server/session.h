@@ -6,11 +6,13 @@
 #ifndef SESSION_H
 #define SESSION_H
 
+#include "server.h"
+
 /*
  * Serves the client connected on `fd` until it leaves (QUIT, disconnection or
  * protocol error). `peer` is the client's "ip:port", used in every log line.
  * It does NOT close `fd`: the caller (the client thread) does.
  */
-void session_run(int fd, const char *peer);
+void session_run(Server *srv, int fd, const char *peer);
 
 #endif /* SESSION_H */

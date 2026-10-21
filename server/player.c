@@ -8,9 +8,10 @@
 
 #include "logger.h"
 
-void player_init(Player *p, int fd, const char *peer)
+void player_init(Player *p, Server *srv, int fd, const char *peer)
 {
     memset(p, 0, sizeof *p);
+    p->srv   = srv;
     p->fd    = fd;
     p->peer  = peer;
     p->state = ST_CONNECTED;
@@ -33,7 +34,7 @@ int player_send(Player *p, MsgType type, const uint8_t *payload, size_t len)
     pthread_mutex_unlock(&p->send_lock);
 
     if (st != PROTO_OK) {
-        log_event(LOG_ERROR, "%s send %s: %s", p->peer, proto_type_name(type), strerror(saved_errno));
+        log_event(&p->srv->log, LOG_ERROR, "%s send %s: %s", p->peer, proto_type_name(type), strerror(saved_errno));
         return -1;
     }
     return 0;

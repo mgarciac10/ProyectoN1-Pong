@@ -1,17 +1,19 @@
-"""Headless test client (bot) for PongServer. Version 3: register, join and play.
+"""Headless test client (bot) for PongServer. Version 4: register, choose an opponent, play.
 
 Usage examples:
     python bot.py --nick ana                          # register, print the reply, leave
     python bot.py --nick ana --hold 20                # stay connected 20 s, then send QUIT
-    python bot.py --nick ana --join --hold 30         # register, JOIN, print what arrives for 30 s
-    python bot.py --nick ana --play                   # register, JOIN and play a whole match
+    python bot.py --nick ana --list                   # print the list of available players
+    python bot.py --nick ana --join --hold 30         # become available, print what arrives for 30 s
+    python bot.py --nick ana --challenge bob --play   # choose 'bob' (when available) and play
+    python bot.py --nick ana --play                   # find any opponent and play a whole match
     python bot.py --nick ana --email ana@x.co --host 1.2.3.4 --port 5000
 
-To see ERROR(3) NICK_TAKEN, start a first bot with --hold and, meanwhile,
-run a second bot with the same nick.
-To see a whole match, run two bots with --play at the same time. Each bot
-moves its paddle toward the ball (with a small "reaction" error, so goals
-happen). Stop one with Ctrl+C: the other receives GAME_OVER (opponent left).
+With --play (and no --challenge) the bot asks for the list every second: it
+chooses the first available player, or, if nobody is available, becomes
+available itself (JOIN) and keeps looking until somebody is found.
+During the match it moves its paddle toward the ball (with a small aiming
+error, so goals happen). Stop one with Ctrl+C: the other receives GAME_OVER.
 """
 import argparse
 import random
@@ -48,23 +50,63 @@ def print_messages_for(sock, seconds):
         print("RECV  %s" % protocol.describe(msg_type, payload))
 
 
-def play_match(sock):
+def send(sock, msg_type, payload=b"", text=None):
+    frame = protocol.send_msg(sock, msg_type, payload)
+    print("SENT  %s  [%s]" % (text or protocol.TYPE_NAMES[msg_type], protocol.hex_bytes(frame)))
+
+
+def find_match(sock, target):
+    """Gets into a match and returns our side (0 = left, 1 = right).
+    target = a nick to challenge, or None to take any available player."""
+    joined = False
+    last_list = None
+    while True:
+        if target:
+            send(sock, protocol.MSG_PLAY_WITH, protocol.encode_nick(target), "PLAY_WITH %s" % target)
+        else:
+            protocol.send_msg(sock, protocol.MSG_LIST)
+
+        # Read replies for one second, then ask again.
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            sock.settimeout(max(0.05, deadline - time.time()))
+            try:
+                msg_type, payload = protocol.recv_msg(sock)
+            except socket.timeout:
+                break
+
+            if msg_type == protocol.MSG_USER_LIST:
+                nicks = protocol.decode_user_list(payload)
+                if nicks != last_list:
+                    print("RECV  USER_LIST %s" % nicks)
+                    last_list = nicks
+                if nicks:
+                    send(sock, protocol.MSG_PLAY_WITH, protocol.encode_nick(nicks[0]), "PLAY_WITH %s" % nicks[0])
+                elif not joined:
+                    send(sock, protocol.MSG_JOIN)      # nobody available: offer ourselves
+                    joined = True
+                continue
+
+            print("RECV  %s" % protocol.describe(msg_type, payload))
+            if msg_type == protocol.MSG_MATCH_START:
+                return protocol.decode_match_start(payload)[0]
+            # ERROR(6): the chosen player was taken by someone else. ERROR(4): two
+            # players chose each other at once. In both cases: just try again.
+
+
+def play_match(sock, side):
     """Plays until GAME_OVER: follows the ball with the paddle.
     Sends INPUT only when the direction CHANGES (README rule 4)."""
-    side = None
     current_dir = protocol.DIR_STOP
     score = None
     aim_error = 0
     prev_ball_x = None
     coming = False
-    # While WAITING the server sends nothing (it may take minutes until an
-    # opponent joins), so no timeout. Once playing, STATE arrives 30 times per
-    # second: 10 s of silence means the server is gone.
-    sock.settimeout(None)
+    sock.settimeout(10)   # STATE arrives 30 times per second: 10 s of silence = server gone
     while True:
         msg_type, payload = protocol.recv_msg(sock)
 
-        if msg_type == protocol.MSG_STATE and side is not None:
+        if msg_type == protocol.MSG_STATE:
             ball_x, ball_y, left_y, right_y, score_l, score_r = protocol.decode_state(payload)
             if (score_l, score_r) != score:
                 score = (score_l, score_r)
@@ -97,21 +139,20 @@ def play_match(sock):
             continue
 
         print("RECV  %s" % protocol.describe(msg_type, payload))
-        if msg_type == protocol.MSG_MATCH_START:
-            side = protocol.decode_match_start(payload)[0]
-            sock.settimeout(10)
-        elif msg_type == protocol.MSG_GAME_OVER:
+        if msg_type == protocol.MSG_GAME_OVER:
             return
 
 
 def main():
-    parser = argparse.ArgumentParser(description="PongServer test bot (v3: register, join, play)")
+    parser = argparse.ArgumentParser(description="PongServer test bot (v4: register, choose, play)")
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=5000)
     parser.add_argument("--nick", required=True)
     parser.add_argument("--email", default=None, help="default: <nick>@test.com")
-    parser.add_argument("--join", action="store_true", help="send JOIN after REGISTER_OK")
-    parser.add_argument("--play", action="store_true", help="JOIN and play one whole match")
+    parser.add_argument("--list", action="store_true", help="print the list of available players")
+    parser.add_argument("--join", action="store_true", help="become available (JOIN) after REGISTER_OK")
+    parser.add_argument("--challenge", metavar="NICK", help="choose this player as opponent (PLAY_WITH)")
+    parser.add_argument("--play", action="store_true", help="find an opponent and play one whole match")
     parser.add_argument("--hold", type=float, default=0,
                         help="seconds to stay connected (printing what arrives), then QUIT")
     args = parser.parse_args()
@@ -123,40 +164,42 @@ def main():
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         print("Connected to %s:%d" % (args.host, args.port))
 
-        frame = protocol.send_msg(sock, protocol.MSG_REGISTER,
-                                  protocol.encode_register(args.nick, email))
-        print("SENT  REGISTER nick=%s email=%s  [%s]" % (args.nick, email, protocol.hex_bytes(frame)))
-
+        send(sock, protocol.MSG_REGISTER, protocol.encode_register(args.nick, email),
+             "REGISTER nick=%s email=%s" % (args.nick, email))
         try:
             msg_type, payload = protocol.recv_msg(sock)
         except protocol.ConnectionClosed:
             print("The server closed the connection")
             return 1
         print("RECV  %s" % protocol.describe(msg_type, payload))
-
         if msg_type != protocol.MSG_REGISTER_OK:
             return 1
 
-        if args.join or args.play:
-            frame = protocol.send_msg(sock, protocol.MSG_JOIN)
-            print("SENT  JOIN  [%s]" % protocol.hex_bytes(frame))
+        try:
+            if args.list:
+                send(sock, protocol.MSG_LIST)
+                print("RECV  %s" % protocol.describe(*protocol.recv_msg(sock)))
+            if args.play:
+                side = find_match(sock, args.challenge)
+                play_match(sock, side)
+            else:
+                if args.join:
+                    send(sock, protocol.MSG_JOIN)
+                if args.challenge:
+                    send(sock, protocol.MSG_PLAY_WITH, protocol.encode_nick(args.challenge),
+                         "PLAY_WITH %s" % args.challenge)
+                if args.hold > 0:
+                    print("Staying connected for %.0f s..." % args.hold)
+                    if not print_messages_for(sock, args.hold):
+                        return 1
+        except protocol.ConnectionClosed:
+            print("The server closed the connection")
+            return 1
+        except socket.timeout:
+            print("No message from the server for 10 s during the match: giving up")
+            return 1
 
-        if args.play:
-            try:
-                play_match(sock)
-            except protocol.ConnectionClosed:
-                print("The server closed the connection")
-                return 1
-            except socket.timeout:
-                print("No message from the server for 10 s during the match: giving up")
-                return 1
-        elif args.hold > 0:
-            print("Staying connected for %.0f s..." % args.hold)
-            if not print_messages_for(sock, args.hold):
-                return 1
-
-        frame = protocol.send_msg(sock, protocol.MSG_QUIT)
-        print("SENT  QUIT  [%s]" % protocol.hex_bytes(frame))
+        send(sock, protocol.MSG_QUIT)
     return 0
 
 

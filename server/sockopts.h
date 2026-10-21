@@ -5,6 +5,8 @@
 #ifndef SOCKOPTS_H
 #define SOCKOPTS_H
 
+#include "logger.h"
+
 /*
  * Configures a freshly accepted client socket:
  *   - TCP_NODELAY: small messages leave immediately (no Nagle delay).
@@ -15,6 +17,6 @@
  * A failing option is logged as a warning and the connection keeps working.
  * `peer` is the "ip:port" string used in the log.
  */
-void configure_client_socket(int fd, const char *peer);
+void configure_client_socket(Logger *lg, int fd, const char *peer);
 
 #endif /* SOCKOPTS_H */

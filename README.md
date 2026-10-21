@@ -24,14 +24,14 @@ and carried over TCP.
    PongClient A ──┐                    ┌──────────────── PongServer (C) ─────────────────┐
  (Python + pygame)│      TCP           │ main thread ── accept() loop                    │
                   ├───────────────────►│   └─ 1 client thread per connection             │
-   PongClient B ──┘   PongProtocol     │ lobby ── pairs waiting players (FIFO)           │
+   PongClient B ──┘   PongProtocol     │ lobby ── list of available players              │
                                        │   └─ 1 match thread per game (30 ticks/s)       │
                                        │ logger ── console + log file (thread-safe)      │
                                        └─────────────────────────────────────────────────┘
 ```
 
 - **Main thread**: creates the listening socket and calls `accept()` forever. Every new connection gets its own thread.
-- **Client thread**: blocks on `recv()`, decodes the client's messages and acts on them (registration, joining the queue, paddle input).
+- **Client thread**: blocks on `recv()`, decodes the client's messages and acts on them (registration, the list of available players, choosing an opponent, paddle input).
 - **Match thread**: one per active game. Every tick it applies the inputs, moves the ball and paddles, detects collisions and goals, and sends the new state to both players.
 - **Logger**: every relevant event (connections, registrations, matchmaking, goals, errors, disconnections) is printed to the console and appended to the log file under a mutex, so lines from different threads never mix.
 
@@ -50,8 +50,10 @@ are enough, the assignment explicitly allows them, and each thread reads like a 
 | `protocol.c` | PongProtocol v1 only: exact `send`/`recv` of bytes, header and payload encoding/decoding, validation. It knows nothing about threads or sessions. |
 | `sockopts.c` | Options set on every client socket (`TCP_NODELAY`, keepalive, `TCP_USER_TIMEOUT`). |
 | `player.c` | The `Player` object shared between threads, and `player_send()` (one writer at a time per socket). |
-| `lobby.c` | Matchmaking queue: one waiting slot, first come, first served. |
-| `game.c` | Matches: creation, the match thread (game loop and physics), and how a match ends. Owns `game_lock`. |
+| `lobby.c` | Lobby: the list of available players, `USER_LIST`, choosing an opponent (`PLAY_WITH`). |
+| `game.c` | Matches: creation, the match thread (game loop and physics), and how a match ends. |
+| `server.h` | The `Server` context: all the state shared between threads (no global variables). |
+| `logger.c` | Thread-safe logger (see 2.4). |
 
 **Game loop (authoritative server).** Each match thread runs a fixed-timestep loop at 30 ticks/s:
 take a snapshot of both players' last `INPUT` (under `game_lock`) → move the paddles (fixed speed, clamped
@@ -62,19 +64,23 @@ paddle) → detect goals → send `STATE` to both players. Ticks are scheduled o
 drift slower. Clients only send *intentions* (up / down / stop), never positions. That is how the server
 validates every move: a client simply cannot place its paddle or the ball anywhere. After each goal, the
 ball waits ~0.7 s in the centre and is served toward the player who conceded.
-| `logger.c` | Thread-safe logger (see 2.4). |
 
 **Shared state and synchronization.** Several threads work on the same player: its own client thread,
-the client thread of the player who pairs with it, and the match thread. Three mechanisms keep this safe:
+the client thread of the player who chooses it as opponent, and the match thread. Three mechanisms keep this safe:
 
 | Mechanism | Protects | Why |
 |---|---|---|
-| `game_lock` (one global mutex) | The lobby's waiting slot, each player's state / match / side, every match | Pairing, leaving and state changes are *check-then-act* operations: without the lock, two players joining at the same moment could both be paired with the same waiting player. One lock is simple and enough here, because the critical sections are tiny and network sends happen outside it. |
+| `game_lock` (one mutex for the whole game) | The list of available players, each player's state / match / side, every match | Choosing an opponent, leaving and state changes are *check-then-act* operations: without the lock, two players choosing the same opponent at the same moment could both get a match with it. One lock is simple and enough here, because the critical sections are tiny and network sends happen outside it. |
 | `send_lock` (one mutex per player) | Writing to that player's socket | The client thread, the lobby and the match thread may all send to the same client. The lock keeps the bytes of two messages from interleaving on the wire. |
 | `refs` counter + condition variable | The lifetime of a `Player` | A match keeps using its players (it sends `GAME_OVER` to them). A client thread whose player is still referenced waits (`pthread_cond_wait`) before it ends. Otherwise the match could write to freed memory, or to a socket number the OS has already reused for a new client. |
 
-Message order is guaranteed by design: `WAITING` is sent while `game_lock` is held, so no `MATCH_START`
-can overtake it. The match thread is the only sender of `MATCH_START`, `STATE` and `GAME_OVER`.
+Message order is guaranteed by design: `WAITING` and `USER_LIST` are sent while `game_lock` is held, so no
+`MATCH_START` can overtake them. The match thread is the only sender of `MATCH_START`, `STATE` and `GAME_OVER`.
+
+**No global variables.** All the shared state (the logger, the nickname registry, the list of available
+players, `game_lock` and its condition variable) lives in one `Server` struct (`server.h`). `main()` creates
+it and every module receives a pointer to it, directly or through `Player->srv` and `Match->srv`. Each
+field documents which lock protects it, so the dependencies between threads are explicit in the code.
 
 ### 2.2 Transport: why TCP
 
@@ -101,7 +107,7 @@ robust protocol. Two TCP options adapt it to a real-time game:
 PongProtocol lets a client:
 
 1. **Register** a player profile (nickname + e-mail) on the server.
-2. **Join** the matchmaking queue and be paired with the next waiting player (first come, first served).
+2. **See the list of available players and choose its opponent**, or make itself available so that another player can choose it.
 3. **Play** a match: the client sends its paddle *intention* (up / down / stop); the server, which is the only authority on the game state, simulates the match and broadcasts the state to both players 30 times per second.
 4. Be **notified** when the match ends (a player reached 5 points, or the opponent left), and **join again** without reconnecting.
 5. **Leave** at any time.
@@ -132,14 +138,17 @@ Types with the high bit set (`0x80`) are sent by the server.
 | Type | Name | Direction | Payload size | Meaning |
 |---|---|---|---|---|
 | `0x01` | `REGISTER` | C → S | variable | Create my player profile. |
-| `0x02` | `JOIN` | C → S | 0 | Put me in the matchmaking queue. |
+| `0x02` | `JOIN` | C → S | 0 | I am available: others may choose me as their opponent. |
 | `0x03` | `INPUT` | C → S | 1 | My paddle direction changed. |
 | `0x04` | `QUIT` | C → S | 0 | I am leaving; close the connection. |
+| `0x05` | `LIST` | C → S | 0 | Which players are available right now? |
+| `0x06` | `PLAY_WITH` | C → S | variable | I want to play against this available player. |
 | `0x81` | `REGISTER_OK` | S → C | 0 | Registration accepted. |
-| `0x82` | `WAITING` | S → C | 0 | You are queued; waiting for an opponent. |
+| `0x82` | `WAITING` | S → C | 0 | You are available; waiting for someone to choose you. |
 | `0x83` | `MATCH_START` | S → C | variable | A match begins: your side and your opponent. |
 | `0x84` | `STATE` | S → C | 10 | Current positions and score (every tick). |
 | `0x85` | `GAME_OVER` | S → C | 2 | The match ended. |
+| `0x86` | `USER_LIST` | S → C | variable | The players available right now (answer to `LIST`). |
 | `0xFF` | `ERROR` | S → C | 1 | Your last message was rejected. |
 
 #### 2.3.4 Payload layouts
@@ -160,6 +169,15 @@ The header's `length` must be exactly `2 + nick_len + email_len`.
 | Offset | Size | Field | Values |
 |---|---|---|---|
 | 0 | u8 | `dir` | `0` = stop, `1` = up, `2` = down |
+
+**`PLAY_WITH` (0x06)**
+
+| Offset | Size | Field | Rule |
+|---|---|---|---|
+| 0 | u8 | `nick_len` | 1–16 |
+| 1 | `nick_len` | `nick` | the chosen opponent (same rules as in `REGISTER`, compared ignoring case) |
+
+The header's `length` must be exactly `1 + nick_len`.
 
 **`MATCH_START` (0x83)**
 
@@ -187,13 +205,23 @@ The header's `length` must be exactly `2 + nick_len + email_len`.
 | 0 | u8 | `winner` | `0` = left, `1` = right |
 | 1 | u8 | `reason` | `0` = a player reached the winning score, `1` = the opponent left |
 
+**`USER_LIST` (0x86)**
+
+| Offset | Size | Field | Description |
+|---|---|---|---|
+| 0 | u8 | `count` | number of nicks that follow |
+| 1 | — | `count` × (`nick_len`:u8, `nick`) | the available players, in the order they became available |
+
+The list never includes the player who asked. It must fit in one message (255 bytes): at least 14 nicks
+always fit. If more players are available, the oldest ones are listed and the rest are left out.
+
 **`ERROR` (0xFF)**
 
 | Offset | Size | Field | Values |
 |---|---|---|---|
 | 0 | u8 | `code` | see error codes |
 
-`JOIN`, `QUIT`, `REGISTER_OK` and `WAITING` have an empty payload (`length` = 0).
+`JOIN`, `QUIT`, `LIST`, `REGISTER_OK` and `WAITING` have an empty payload (`length` = 0).
 
 #### 2.3.5 Error codes
 
@@ -204,6 +232,7 @@ The header's `length` must be exactly `2 + nick_len + email_len`.
 | 3 | `NICK_TAKEN` | another connected player already uses that nickname | stays open (client may retry) |
 | 4 | `INVALID_STATE` | the message isn't allowed in the client's current state | stays open (message ignored) |
 | 5 | `INVALID_FIELD` | a field breaks its rule (e.g. empty nick, e-mail without `@`, `dir` > 2) | stays open (message ignored) |
+| 6 | `USER_NOT_AVAILABLE` | `PLAY_WITH` names a player who is not available (unknown, not in the list, already chosen by someone else, or yourself) | stays open |
 
 Codes 1 and 2 close the connection because, after a malformed header, the receiver can no longer tell
 where the next message starts: the byte stream is out of sync.
@@ -215,7 +244,7 @@ error it finds:
 2. `length` > 255 → `ERROR(2)`.
 3. `type` is not a message a client may send → `ERROR(2)`. (Up to here the payload is **not** read.)
 4. The message is not allowed in the client's state → `ERROR(4)`, except a late `INPUT` (rule 7 in 2.3.7).
-5. The payload does not fit the message layout (e.g. `length` ≠ 2 + `nick_len` + `email_len`, or a non-empty `JOIN`/`QUIT`) → `ERROR(2)`.
+5. The payload does not fit the message layout (e.g. `length` ≠ 2 + `nick_len` + `email_len`, or a non-empty `JOIN`/`QUIT`/`LIST`) → `ERROR(2)`.
 6. A field breaks its rule (2.3.4) → `ERROR(5)`.
 
 When the server closes the connection after `ERROR(1)` or `ERROR(2)`, it first stops sending
@@ -247,8 +276,8 @@ values up to 800 are sent, and negative values are sent as 0.
 | State | Allowed client messages | Anything else |
 |---|---|---|
 | `CONNECTED` | `REGISTER`, `QUIT` | `ERROR(4)` |
-| `REGISTERED` | `JOIN`, `QUIT` | `ERROR(4)` |
-| `WAITING` | `QUIT` | `ERROR(4)` |
+| `REGISTERED` | `JOIN`, `LIST`, `PLAY_WITH`, `QUIT` | `ERROR(4)` |
+| `WAITING` | `LIST`, `PLAY_WITH`, `QUIT` | `ERROR(4)` |
 | `PLAYING` | `INPUT`, `QUIT` | `ERROR(4)` |
 
 ```mermaid
@@ -256,9 +285,10 @@ stateDiagram-v2
     [*] --> CONNECTED: TCP connection accepted
     CONNECTED --> CONNECTED: REGISTER invalid or nick taken / ERROR(3 or 5)
     CONNECTED --> REGISTERED: REGISTER valid / REGISTER_OK
-    REGISTERED --> WAITING: JOIN, nobody waiting / WAITING
-    REGISTERED --> PLAYING: JOIN, someone waiting / MATCH_START
-    WAITING --> PLAYING: opponent joins / MATCH_START
+    REGISTERED --> REGISTERED: LIST / USER_LIST
+    REGISTERED --> WAITING: JOIN / WAITING
+    REGISTERED --> PLAYING: PLAY_WITH an available player / MATCH_START
+    WAITING --> PLAYING: chosen by someone, or PLAY_WITH / MATCH_START
     PLAYING --> REGISTERED: match ends / GAME_OVER
     CONNECTED --> [*]: QUIT, disconnect or ERROR(1 or 2)
     REGISTERED --> [*]: QUIT or disconnect
@@ -268,21 +298,21 @@ stateDiagram-v2
 
 **Rules**
 
-1. **Registration first.** A client must register before anything else. The nickname must be unique among *connected* players, **ignoring upper/lower case** (`ana` and `Ana` are the same nickname). Profiles live in memory and are released when the client disconnects.
-2. **Matchmaking.** On `JOIN`, if another player is waiting, both are paired at once and receive `MATCH_START`. Otherwise the client receives `WAITING` and is paired with the next player who joins.
+1. **Registration first (identification).** A client must register before anything else: until the server accepts its `REGISTER`, every other message is rejected with `ERROR(4)`. This is how the server identifies (authenticates) each client: the nickname must be valid and unique among *connected* players, **ignoring upper/lower case** (`ana` and `Ana` are the same nickname), and the e-mail must be valid. Profiles live in memory and are released when the client disconnects. There are no passwords: without persistent accounts there would be nothing for a password to protect.
+2. **Choosing an opponent.** A registered player who sends `JOIN` becomes **available**: it receives `WAITING` and appears in the list of every other player. `LIST` returns that list (`USER_LIST`). `PLAY_WITH(nick)` starts a match at once against that player if it is still available: both receive `MATCH_START` and leave the list. Otherwise the answer is `ERROR(6)`. Being available means accepting to be chosen, so there is no invitation to accept. An available player may also choose someone else from the list. A player in a match does not appear in the list, and cannot start another match (`JOIN`, `LIST` and `PLAY_WITH` get `ERROR(4)`). If two players choose each other at the same moment, one match starts and the other request gets `ERROR(4)`: it crossed the `MATCH_START`.
 3. **Authoritative server.** `INPUT` only changes the paddle's *direction*. The server moves the paddle at its own fixed speed, keeps it inside the field, moves the ball, detects collisions and goals, and keeps the score. Clients never send positions.
 4. **State broadcast.** During a match, the server sends `STATE` to both players every tick. The client sends `INPUT` only when the direction **changes** (not every frame).
-5. **End of match.** When a player reaches 5 points, both receive `GAME_OVER(winner, 0)` and return to `REGISTERED`. They may `JOIN` again on the same connection.
+5. **End of match.** When a player reaches 5 points, both receive `GAME_OVER(winner, 0)` and return to `REGISTERED`. They may `LIST`, `JOIN` or `PLAY_WITH` again on the same connection.
 6. **Opponent leaves.** If a player sends `QUIT`, disconnects, or is detected as dead during a match, the opponent receives `GAME_OVER(opponent's side, 1)` and returns to `REGISTERED`.
 7. **Late input.** An `INPUT` received outside `PLAYING` is **silently discarded**, not answered with an error. It may legitimately cross a `GAME_OVER` that is already on its way to the client.
-8. **Leaving.** After `QUIT` the server closes the connection. A player who quits while `WAITING` is removed from the queue.
-9. **Errors.** See error codes: protocol violations (1, 2) close the connection; semantic errors (3, 4, 5) are reported and the message is ignored.
+8. **Leaving.** After `QUIT` the server closes the connection. A player who quits while `WAITING` is removed from the list of available players.
+9. **Errors.** See error codes: protocol violations (1, 2) close the connection; semantic errors (3, 4, 5, 6) are reported and the message is ignored.
 
 **Liveness (dead-peer detection)**
 
 A client can disappear without closing its connection: it loses Wi-Fi, switches networks, or its machine
 crashes. Since TCP sends nothing on an idle connection, the server would wait in `recv()` forever. A
-"ghost" player would then stay in the queue, or freeze a match. PongProtocol has no heartbeat message.
+"ghost" player would then stay in the list of available players, or freeze a match. PongProtocol has no heartbeat message.
 Instead, the server configures every client socket with:
 
 | Socket option | Value | Covers |
@@ -297,7 +327,7 @@ configuration.
 
 #### 2.3.8 Sequence diagrams
 
-**Normal flow: register, match, game over, leave**
+**Normal flow: register, choose an opponent, match, game over, leave**
 
 ```mermaid
 sequenceDiagram
@@ -310,7 +340,9 @@ sequenceDiagram
     S-->>A: WAITING
     B->>S: REGISTER("bob", "bob@y.co")
     S-->>B: REGISTER_OK
-    B->>S: JOIN
+    B->>S: LIST
+    S-->>B: USER_LIST(["ana"])
+    B->>S: PLAY_WITH("ana")
     S-->>A: MATCH_START(side=0, "bob")
     S-->>B: MATCH_START(side=1, "ana")
     loop every tick (~33 ms)
@@ -350,7 +382,7 @@ sequenceDiagram
     Note over S,B: no ACK from B for 10 s, TCP_USER_TIMEOUT aborts the connection
     Note over S: B's recv() fails, B is treated as disconnected
     S-->>A: GAME_OVER(winner=0, reason=1)
-    Note over A: back to REGISTERED, may JOIN again
+    Note over A: back to REGISTERED, may choose again
 ```
 
 #### 2.3.9 Byte-level example
@@ -413,21 +445,24 @@ make
 cd client
 python bot.py --nick ana                        # register, print the server's reply, send QUIT
 python bot.py --nick ana --hold 20              # stay registered for 20 s before QUIT
-python bot.py --nick ana --join --hold 30       # JOIN the queue and print what arrives for 30 s
-python bot.py --nick ana --play                 # JOIN and play a whole match automatically
+python bot.py --nick ana --list                 # print the list of available players
+python bot.py --nick ana --join --hold 30       # become available and print what arrives for 30 s
+python bot.py --nick bob --challenge ana --play # choose 'ana' (when she is available) and play
+python bot.py --nick ana --play                 # find any opponent and play a whole match automatically
 python bot.py --nick ana --host 1.2.3.4 --port 5000 --email ana@x.co
 ```
 
-With `--play`, the bot moves its paddle toward the ball (with a random aiming error, so goals happen),
+With `--play` (and no `--challenge`), the bot asks for the list every second: it chooses the first available
+player or, if nobody is available, becomes available itself and keeps looking. In the match it moves its paddle toward the ball (with a random aiming error, so goals happen),
 sends `INPUT` only when its direction changes, and leaves after `GAME_OVER`. Two `--play` bots play a
 whole match in about a minute. The test campaign used 20 bots at once (10 simultaneous matches).
 
 Run `bot.py --nick ana --hold 20` and, meanwhile, a second `bot.py --nick ANA`: the second one receives
 `ERROR code=3 (NICK_TAKEN)`.
 
-Run two bots with `--join --hold 30` at the same time: the first receives `WAITING`, then both receive
-`MATCH_START` with opposite sides. Stop one of them with Ctrl+C: the other receives
-`GAME_OVER winner=… reason=1 (opponent left)`.
+Run `bot.py --nick ana --join --hold 60` and then `bot.py --nick bob --challenge ana --hold 60`: ana receives
+`WAITING`, then both receive `MATCH_START` with opposite sides. Stop one of them with Ctrl+C: the other
+receives `GAME_OVER winner=… reason=1 (opponent left)`.
 
 **Inspecting the protocol by hand** (Linux). A garbage message gets `ERROR(1)` and the connection is
 closed, but the server keeps running:
@@ -446,8 +481,10 @@ python pong_client.py --host 1.2.3.4 --port 5000 --nick ana --email ana@x.co
 ```
 
 Registration happens in the console (if the nickname is taken, it asks for another one on the same
-connection). Then the window opens: `J` joins a match (and plays again after one), `↑`/`↓` or `W`/`S`
-move the paddle (your paddle is the blue one), `Q` or `Esc` quits (sends `QUIT`).
+connection). Then the window opens with the list of available players (refreshed every 1.5 s with `LIST`):
+`1`–`9` plays against that player, `J` makes you available so that others can choose you, `↑`/`↓` or
+`W`/`S` move the paddle (yours is the blue one), and `Q` or `Esc` quits (sends `QUIT`). The score is always
+on screen during the match, and the final score is shown when it ends.
 
 **Client design.** A receiver thread blocks on `recv()` and puts every message in a thread-safe queue,
 while the main thread runs the pygame loop at 60 frames/s: it empties the queue, draws the last `STATE`,
