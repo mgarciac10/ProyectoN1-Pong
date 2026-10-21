@@ -437,7 +437,23 @@ printf 'hola\n' | nc -N localhost 5000 | xxd    # -> 01ff 0001 01
 sudo tcpdump -i lo -X -nn port 5000             # raw bytes of a bot session (run the bot from the same machine)
 ```
 
-**Pong client (pygame)**: *to be completed (Phase 7).*
+**Pong client (pygame)**, Python 3 + pygame (`pip install -r client/requirements.txt`):
+
+```bash
+cd client
+python pong_client.py                                    # server on localhost:5000, asks nick and e-mail
+python pong_client.py --host 1.2.3.4 --port 5000 --nick ana --email ana@x.co
+```
+
+Registration happens in the console (if the nickname is taken, it asks for another one on the same
+connection). Then the window opens: `J` joins a match (and plays again after one), `↑`/`↓` or `W`/`S`
+move the paddle (your paddle is the blue one), `Q` or `Esc` quits (sends `QUIT`).
+
+**Client design.** A receiver thread blocks on `recv()` and puts every message in a thread-safe queue,
+while the main thread runs the pygame loop at 60 frames/s: it empties the queue, draws the last `STATE`,
+and sends `INPUT` only when the paddle direction changes (holding a key sends one message, not 60 per
+second). Only the main thread sends, so the client needs no lock on its socket. The client never computes
+positions: it only draws what the server says.
 
 ---
 

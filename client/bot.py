@@ -82,9 +82,11 @@ def play_match(sock):
             paddle_y = left_y if side == 0 else right_y
             target = ball_y + protocol.BALL_SIZE / 2 + aim_error
             centre = paddle_y + protocol.PADDLE_H / 2
-            if target < centre - 6:
+            # Dead zone of ±12: wider than one paddle step (9 per tick), otherwise
+            # the paddle overshoots every tick and the bot floods the server with INPUT.
+            if target < centre - 12:
                 wanted = protocol.DIR_UP
-            elif target > centre + 6:
+            elif target > centre + 12:
                 wanted = protocol.DIR_DOWN
             else:
                 wanted = protocol.DIR_STOP
