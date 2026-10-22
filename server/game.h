@@ -4,7 +4,8 @@
  * srv->game_lock (server.h) protects ALL the shared game state: the lobby, the
  * [game_lock] fields of every Player, and every Match. A single lock is
  * simple and enough for this project: the critical sections are tiny, and
- * sends to the network happen OUTSIDE it (except WAITING, see lobby.c).
+ * sends to the network happen OUTSIDE it (except WAITING and USER_LIST, see
+ * lobby.c and session.c).
  */
 #ifndef GAME_H
 #define GAME_H

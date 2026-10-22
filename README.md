@@ -492,6 +492,41 @@ and sends `INPUT` only when the paddle direction changes (holding a key sends on
 second). Only the main thread sends, so the client needs no lock on its socket. The client never computes
 positions: it only draws what the server says.
 
+### 2.6 Deployment on AWS (EC2, AWS Academy Learner Lab)
+
+PongServer runs on an EC2 instance. The clients connect to its public IP on port 5000.
+
+| Item | Value |
+|---|---|
+| Region / AMI / type | `us-east-1` · Ubuntu Server 26.04 LTS · `t2.micro` |
+| Key pair | `vockey` (Learner Lab key, `labsuser.pem`) |
+| Security group `pong-sg` (inbound) | **TCP 5000 from `0.0.0.0/0`** (players from any network) · **SSH 22 from "My IP" only** (administration) |
+| Code | `git clone` of this repository, using a read-only **deploy key** (an SSH key of the instance registered in GitHub → Settings → Deploy keys) |
+| Process | `./server 5000 pong.log` inside a `tmux` session, so it keeps running after SSH disconnects |
+
+First deployment:
+
+```bash
+# on your machine
+ssh -i ~/.ssh/labsuser.pem ubuntu@<PUBLIC_IP>          # labsuser.pem with chmod 400
+
+# on the instance
+sudo apt update && sudo apt install -y build-essential git tmux
+ssh-keygen -t ed25519 -C "pong-ec2-deploy" -f ~/.ssh/id_ed25519   # add the .pub as a deploy key in GitHub
+git clone git@github.com:mgarciac10/ProyectoN1-Pong.git
+cd ProyectoN1-Pong/server && make
+tmux new -s pong                                       # then: ./server 5000 pong.log
+                                                       # detach: Ctrl+B, D · back: tmux attach -t pong
+```
+
+After every new Learner Lab session (the lab stops the instance and the **public IP changes**): start the
+instance, get its new public IP, then on the instance run
+`cd ~/ProyectoN1-Pong && git pull && cd server && make` and start the server again in `tmux`. If SSH hangs
+(timeout), your own public IP has probably changed: update the SSH rule of `pong-sg` to "My IP".
+
+Clients connect with `python pong_client.py --host <PUBLIC_IP> --port 5000`. The log is
+`~/ProyectoN1-Pong/server/pong.log` on the instance (`tail -f pong.log` to watch it live).
+
 ---
 
 ## 3. Conclusions
