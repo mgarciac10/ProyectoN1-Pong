@@ -28,6 +28,10 @@ import pygame
 
 import protocol
 
+# PongServer on AWS (EC2 with an Elastic IP, so the address does not change).
+# Offered as the default answer when the client asks for the server address.
+DEFAULT_SERVER = "34.199.2.92"
+
 FPS = 60
 LIST_EVERY = 1.5            # seconds between LIST requests while in the menu
 BG = (15, 15, 25)
@@ -255,18 +259,29 @@ class PongClient:
         pygame.quit()
 
 
+def ask(prompt, default):
+    """Console question with a default value (used when started with a double click)."""
+    answer = input("%s [%s]: " % (prompt, default)).strip()
+    return answer or default
+
+
 def main():
     parser = argparse.ArgumentParser(description="PongClient (pygame)")
-    parser.add_argument("--host", default="localhost")
-    parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument("--host", help="server address (asked in the console if not given; "
+                                       "Enter = %s)" % DEFAULT_SERVER)
+    parser.add_argument("--port", type=int, help="server port (asked if --host is not given)")
     parser.add_argument("--nick")
     parser.add_argument("--email")
     args = parser.parse_args()
 
+    # Started without arguments (e.g. the .exe with a double click): ask.
+    host = args.host or ask("Server address", DEFAULT_SERVER)
+    port = args.port or (5000 if args.host else int(ask("Server port", "5000")))
+
     try:
-        sock, nick = connect_and_register(args.host, args.port, args.nick, args.email)
+        sock, nick = connect_and_register(host, port, args.nick, args.email)
     except OSError as e:
-        print("Cannot connect to %s:%d: %s" % (args.host, args.port, e))
+        print("Cannot connect to %s:%d: %s" % (host, port, e))
         return 1
     except (protocol.ConnectionClosed, protocol.ProtocolError) as e:
         print("Registration failed: %s" % (e or "the server closed the connection"))
@@ -277,4 +292,9 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    code = main()
+    # Packaged as an .exe (PyInstaller sets sys.frozen), the console window would
+    # close at once and hide any error message: wait for Enter first.
+    if code != 0 and getattr(sys, "frozen", False):
+        input("Press Enter to close...")
+    sys.exit(code)

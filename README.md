@@ -476,9 +476,21 @@ sudo tcpdump -i lo -X -nn port 5000             # raw bytes of a bot session (ru
 
 ```bash
 cd client
-python pong_client.py                                    # server on localhost:5000, asks nick and e-mail
+python pong_client.py                                    # asks server address (Enter = AWS), port, nick, e-mail
 python pong_client.py --host 1.2.3.4 --port 5000 --nick ana --email ana@x.co
 ```
+
+**Windows executable.** For demos, the client can be packaged as a single `PongClient.exe` (~15 MB,
+Python and pygame included, nothing to install). Double-click it: a console asks for the server address
+(Enter = the AWS server `34.199.2.92`, or type e.g. `localhost`), port, nickname and e-mail, then the game window opens. It also accepts the same command-line options.
+
+```bash
+cd client
+pip install pyinstaller
+pyinstaller --onefile --console --name PongClient pong_client.py   # -> client/dist/PongClient.exe
+```
+
+The executable is a build product, so it is not stored in git (`client/dist/` is ignored).
 
 Registration happens in the console (if the nickname is taken, it asks for another one on the same
 connection). Then the window opens with the list of available players (refreshed every 1.5 s with `LIST`):
@@ -494,12 +506,13 @@ positions: it only draws what the server says.
 
 ### 2.6 Deployment on AWS (EC2, AWS Academy Learner Lab)
 
-PongServer runs on an EC2 instance. The clients connect to its public IP on port 5000.
+PongServer runs on an EC2 instance with a fixed public address: **`34.199.2.92`, port 5000**.
 
 | Item | Value |
 |---|---|
 | Region / AMI / type | `us-east-1` · Ubuntu Server 26.04 LTS · `t2.micro` |
 | Key pair | `vockey` (Learner Lab key, `labsuser.pem`) |
+| Public address | **Elastic IP `34.199.2.92`**, associated with the instance. It survives stop/start, unlike the default public IP |
 | Security group `pong-sg` (inbound) | **TCP 5000 from `0.0.0.0/0`** (players from any network) · **SSH 22 from "My IP" only** (administration) |
 | Code | `git clone` of this repository, using a read-only **deploy key** (an SSH key of the instance registered in GitHub → Settings → Deploy keys) |
 | Process | `./server 5000 pong.log` inside a `tmux` session, so it keeps running after SSH disconnects |
@@ -508,7 +521,7 @@ First deployment:
 
 ```bash
 # on your machine
-ssh -i ~/.ssh/labsuser.pem ubuntu@<PUBLIC_IP>          # labsuser.pem with chmod 400
+ssh -i ~/.ssh/labsuser.pem ubuntu@34.199.2.92         # labsuser.pem with chmod 400
 
 # on the instance
 sudo apt update && sudo apt install -y build-essential git tmux
@@ -519,12 +532,14 @@ tmux new -s pong                                       # then: ./server 5000 pon
                                                        # detach: Ctrl+B, D · back: tmux attach -t pong
 ```
 
-After every new Learner Lab session (the lab stops the instance and the **public IP changes**): start the
-instance, get its new public IP, then on the instance run
-`cd ~/ProyectoN1-Pong && git pull && cd server && make` and start the server again in `tmux`. If SSH hangs
+After every new Learner Lab session (the lab stops the instance when the session ends): start the
+instance (the Elastic IP stays the same), then on the instance run
+`cd ~/ProyectoN1-Pong && git pull && cd server && make` and start the server again in `tmux`.
+Without an Elastic IP, the public IP would change at every start. The Elastic IP is released at the end
+of the course (EC2 → Elastic IPs → Release), because AWS charges for public IPv4 addresses. If SSH hangs
 (timeout), your own public IP has probably changed: update the SSH rule of `pong-sg` to "My IP".
 
-Clients connect with `python pong_client.py --host <PUBLIC_IP> --port 5000`. The log is
+Clients connect with `PongClient.exe` (Enter at "Server address") or `python pong_client.py --host 34.199.2.92`. The log is
 `~/ProyectoN1-Pong/server/pong.log` on the instance (`tail -f pong.log` to watch it live).
 
 ---
