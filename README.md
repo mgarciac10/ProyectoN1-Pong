@@ -12,7 +12,40 @@ and carried over TCP.
 
 ## 1. Introduction
 
-*To be completed in the final phase.*
+Networked games are a demanding case for network programming. Several players connect over the
+Internet at the same time, every action has to reach the other side quickly and in order, and one party
+must decide what really happened, so that two players never see two different games. This project builds
+the communications for an online version of **Pong** (1972) following a client/server architecture, as
+the assignment requires: the server owns the game state, and the clients only send what the player
+wants to do and draw what the server says.
+
+**Goals**
+
+1. Design and specify an **application-layer protocol**, *PongProtocol*, with **binary encoding**: its
+   service, message vocabulary, encoding and procedure rules, documented with state and sequence
+   diagrams.
+2. Implement it on both sides with the **Berkeley sockets API**: a **server in C** (gcc, Makefile) and a
+   **client in Python**, with the protocol code kept separate from the application logic.
+3. Support **many simultaneous matches** with POSIX threads.
+4. Let every client **register**, see the **list of available players**, **choose its opponent**, and
+   play with the **score always visible**. A player who is in a match cannot start another one.
+5. **Log** every request, response and relevant event to the console and to a log file
+   (`./server <PORT> <LogFile>`).
+6. **Deploy** the server on **AWS** (EC2) and play over the Internet.
+
+**Summary of the solution**
+
+| Part | Choice |
+|---|---|
+| Transport | TCP (`SOCK_STREAM`), one connection per client, `TCP_NODELAY`, keepalive + `TCP_USER_TIMEOUT` to detect dead clients (§2.2, §2.3.7) |
+| Protocol | PongProtocol v1: 4-byte header (version, type, length) + payload, big-endian, 13 message types and 6 error codes (§2.3) |
+| Server | C11, raw Berkeley sockets, one thread per client + one thread per match, authoritative 30 Hz game loop, no global variables (§2.1) |
+| Client | Python 3 + pygame, plain `socket` + `struct`, receiver thread + UI loop. Also packaged as a Windows `.exe` (§2.5) |
+| Deployment | AWS EC2 (Learner Lab) with a fixed Elastic IP, `34.199.2.92:5000` (§2.6) |
+
+The rest of this document describes the architecture (§2.1), justifies TCP (§2.2), specifies the protocol
+(§2.3), explains the logger (§2.4), how to build and run everything (§2.5), the AWS deployment (§2.6) and
+how the system was tested (§2.7), and ends with the conclusions (§3).
 
 ---
 
@@ -542,11 +575,75 @@ of the course (EC2 → Elastic IPs → Release), because AWS charges for public 
 Clients connect with `PongClient.exe` (Enter at "Server address") or `python pong_client.py --host 34.199.2.92`. The log is
 `~/ProyectoN1-Pong/server/pong.log` on the instance (`tail -f pong.log` to watch it live).
 
+### 2.7 Testing
+
+The system was built in small phases, and every phase was tested before moving on. Besides playing with
+the pygame client, the tests used four tools:
+
+- **Hand-written bytes.** Short Python scripts open raw sockets and send exact byte sequences (valid
+  messages, and also every kind of malformed one), then compare the server's answer byte by byte with the
+  specification. `tcpdump` was used to look at the bytes on the wire.
+- **The bot** (`client/bot.py`), a client without a window that registers, lists, chooses or waits for
+  an opponent and plays a whole match by itself. It was used to run many clients at once.
+- **Sanitizers.** The server was also built with `-fsanitize=thread` (ThreadSanitizer, finds data races)
+  and `-fsanitize=address,undefined` (finds memory errors and undefined behaviour), and every test was run
+  against those builds as well. The code also builds with `-Wall -Wextra -Wpedantic -Wshadow
+  -Wconversion` with no warnings.
+- **Headless client.** The pygame client was driven automatically (virtual video driver, simulated key
+  presses, screenshots) to check its whole flow.
+
+| Area | What was checked | Result |
+|---|---|---|
+| Framing | A message sent one byte at a time; two messages glued in one `send()`; peer closing mid-message | Correct |
+| Registration | Valid / invalid fields (`ERROR(5)`), nickname taken ignoring case (`ERROR(3)`) and retry on the same connection, nickname freed after `QUIT` or an abrupt reset | Correct |
+| Protocol errors | Wrong version, unknown type, server-only type sent by a client, `length` > 255, payload not matching the layout, plain text (`hola\n`) → `ERROR(1)`/`ERROR(2)` and close | Correct, the server keeps running |
+| State rules | Every message outside its state → `ERROR(4)`; a late `INPUT` silently discarded | Correct |
+| Lobby | `LIST`/`USER_LIST`, `PLAY_WITH` an available / unknown / unavailable player / yourself (`ERROR(6)`), available player leaving, list never longer than 255 bytes | Correct |
+| Races | 40 clients registering the **same** nickname at once → exactly 1 accepted · 20 clients choosing the **same** opponent at once → exactly 1 match, 19 `ERROR(6)` | Correct |
+| Game | 30 `STATE`/s, paddle speed and limits, ball always in the field, goals, end at 5 points, opponent leaving → `GAME_OVER(reason 1)`, playing again on the same connection | Correct |
+| Concurrency | **10 simultaneous matches** (20 bots), locally and on AWS. The thread count is always 1 + clients + matches, and goes back to 1 when everyone leaves | All matches end by score |
+| Sanitizers | ThreadSanitizer and AddressSanitizer + UndefinedBehaviorSanitizer on all the scenarios above | 0 reports |
+| Robustness | `SIGPIPE` experiment: without `SIG_IGN` the server dies when it writes to a closed connection, with it every client is served · half-open connection (phone switching from Wi-Fi to mobile data) → detected by keepalive | As designed |
+| Internet | Clients on Windows, WSL, a phone on Wi-Fi and on mobile data, against the EC2 server: ~77 ms round trip | Playable |
+
+**Bugs found by testing and fixed** (selection): a committed `main.c` that did not compile (missing
+brace); a nickname released ~1 s late after `QUIT`, which would have left ghost players in the lobby; a
+bot with too small a dead zone that sent ~25 `INPUT`/s (now ~9); a bot that gave up after 30 s of waiting
+for an opponent.
+
 ---
 
 ## 3. Conclusions
 
-*To be completed in the final phase.*
+- **The protocol is the contract.** Writing the specification first (service, vocabulary, encoding,
+  rules, diagrams) and only then the code let the C server and the Python client work together although
+  they share no code, only the document. Several decisions came from thinking through "what if…?"
+  cases on paper: what to do with an `INPUT` that crosses a `GAME_OVER` (discard it silently), which errors
+  must close the connection (only those after which the byte stream can no longer be trusted), and why the
+  server must send `WAITING` and `USER_LIST` before anyone can send `MATCH_START`.
+- **TCP is a byte stream, not a message stream.** This was visible from the first echo server: two lines
+  arrived in a single `recv()`. A length field in the header and loops that read *exactly* N bytes
+  (`recv_all`/`send_all`) are what turn the stream into messages. A receiver must also never trust the
+  length it receives before validating it.
+- **TCP was the right choice for this project.** Reliability and ordering come for free, the connection
+  works behind home routers (NAT), and with `TCP_NODELAY` and ~14-byte messages the game is fluid even at
+  ~77 ms of latency. The price is head-of-line blocking on lossy networks: a large-scale action game would
+  send the game state over UDP and keep the control messages on TCP.
+- **Concurrency needs explicit rules, not luck.** Thread-per-client keeps every session simple to read,
+  but shared state needs a clear discipline: one lock for the game state (simple, and enough at this
+  scale), one lock per socket so messages never interleave, a fixed lock order, and a reference counter
+  plus a condition variable so that no thread ever writes to a player that has already left. A reused
+  socket number would deliver one player's messages to a stranger. ThreadSanitizer confirmed 0 data races.
+- **Real networks fail in ways a local test never shows.** Writing to a closed socket kills the whole
+  process (`SIGPIPE`) unless it is ignored. A phone that changed networks left a "ghost" connection that
+  TCP alone never reports. Keepalive and `TCP_USER_TIMEOUT` were the answer. Firewalls (security
+  groups), changing public IPs and NAT were part of deploying on AWS too.
+- **Limitations and possible improvements.** Profiles live only in memory and there are no passwords
+  (registration identifies, it does not create accounts). A player cannot accept or decline being chosen:
+  being available means accepting. The list of available players holds at most 14 long nicknames per
+  message. One thread per client does not scale to thousands of players (`epoll` would). There is no
+  reconnection to a running match and no encryption (TLS). Natural next steps would be persistent accounts,
+  invitations with accept/decline, game state over UDP, and spectators.
 
 ---
 
@@ -557,4 +654,10 @@ Clients connect with `PongClient.exe` (Enter at "Server address") or `python pon
 - GeeksforGeeks, *TCP Server-Client implementation in C*. https://www.geeksforgeeks.org/tcp-server-client-implementation-in-c/
 - W. Eddy, *RFC 9293: Transmission Control Protocol (TCP)*, IETF, 2022.
 - *Pong*. Wikipedia. https://en.wikipedia.org/wiki/Pong
-- Linux man pages: `socket(7)`, `tcp(7)`, `pthreads(7)`.
+- Linux man pages: `socket(7)`, `tcp(7)`, `pthreads(7)`, `pthread_cond_wait(3p)`, `clock_nanosleep(2)`.
+- Python Software Foundation, *socket — Low-level networking interface* and *struct — Interpret bytes as packed binary data*. https://docs.python.org/3/library/socket.html · https://docs.python.org/3/library/struct.html
+- *pygame documentation*. https://www.pygame.org/docs/
+- *PyInstaller manual*. https://pyinstaller.org/
+- Amazon Web Services, *Amazon EC2 security groups* and *Elastic IP addresses* (EC2 User Guide). https://docs.aws.amazon.com/ec2/
+- Google, *ThreadSanitizer* and *AddressSanitizer* (sanitizers documentation). https://github.com/google/sanitizers
+- *Mermaid* diagramming syntax. https://mermaid.js.org/
