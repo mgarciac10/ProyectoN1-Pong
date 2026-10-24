@@ -1,426 +1,383 @@
-# Pong — Networked Game over PongProtocol
+# Pong en red sobre PongProtocol
 
-Project N1 · Internet: Architecture and Protocols
+Proyecto N1 · Internet: Arquitectura y Protocolos
 
-A client/server implementation of the classic **Pong** game. The server (**PongServer**, written in C with
-Berkeley sockets and POSIX threads) keeps the authoritative game state for many simultaneous matches.
-The clients (**PongClient**, Python + pygame) send the player's input and draw the state they receive.
-Both sides talk through **PongProtocol**, a binary application-layer protocol designed for this project
-and carried over TCP.
-
----
-
-## 1. Introduction
-
-Networked games are a demanding case for network programming. Several players connect over the
-Internet at the same time, every action has to reach the other side quickly and in order, and one party
-must decide what really happened, so that two players never see two different games. This project builds
-the communications for an online version of **Pong** (1972) following a client/server architecture, as
-the assignment requires: the server owns the game state, and the clients only send what the player
-wants to do and draw what the server says.
-
-**Goals**
-
-1. Design and specify an **application-layer protocol**, *PongProtocol*, with **binary encoding**: its
-   service, message vocabulary, encoding and procedure rules, documented with state and sequence
-   diagrams.
-2. Implement it on both sides with the **Berkeley sockets API**: a **server in C** (gcc, Makefile) and a
-   **client in Python**, with the protocol code kept separate from the application logic.
-3. Support **many simultaneous matches** with POSIX threads.
-4. Let every client **register**, see the **list of available players**, **choose its opponent**, and
-   play with the **score always visible**. A player who is in a match cannot start another one.
-5. **Log** every request, response and relevant event to the console and to a log file
-   (`./server <PORT> <LogFile>`).
-6. **Deploy** the server on **AWS** (EC2) and play over the Internet.
-
-**Summary of the solution**
-
-| Part | Choice |
-|---|---|
-| Transport | TCP (`SOCK_STREAM`), one connection per client, `TCP_NODELAY`, keepalive + `TCP_USER_TIMEOUT` to detect dead clients (§2.2, §2.3.7) |
-| Protocol | PongProtocol v1: 4-byte header (version, type, length) + payload, big-endian, 13 message types and 6 error codes (§2.3) |
-| Server | C11, raw Berkeley sockets, one thread per client + one thread per match, authoritative 30 Hz game loop, no global variables (§2.1) |
-| Client | Python 3 + pygame, plain `socket` + `struct`, receiver thread + UI loop. Also packaged as a Windows `.exe` (§2.5) |
-| Deployment | AWS EC2 (Learner Lab) with a fixed Elastic IP, `34.199.2.92:5000` (§2.6) |
-
-The rest of this document describes the architecture (§2.1), justifies TCP (§2.2), specifies the protocol
-(§2.3), explains the logger (§2.4), how to build and run everything (§2.5), the AWS deployment (§2.6) and
-how the system was tested (§2.7), and ends with the conclusions (§3).
+Implementación cliente/servidor del Pong clásico. El servidor (**PongServer**) está escrito en C con
+sockets Berkeley e hilos POSIX y guarda el estado de todas las partidas. Los clientes (**PongClient**,
+Python + pygame) solo envían lo que el jugador quiere hacer y dibujan lo que el servidor les cuenta.
+Ambos hablan **PongProtocol**, un protocolo binario de capa de aplicación que diseñamos para este
+proyecto y que viaja sobre TCP.
 
 ---
 
-## 2. Development
+## 1. Introducción
 
-### 2.1 Architecture
+El objetivo del proyecto era diseñar un protocolo de aplicación propio y probarlo con una aplicación
+real que usara sockets. Escogimos Pong porque es un juego de dos jugadores con reglas pequeñas, pero
+obliga a resolver los problemas típicos de una aplicación en red: registrar usuarios, emparejarlos,
+mantener un estado compartido que cambia 30 veces por segundo, y reaccionar cuando alguien se
+desconecta sin avisar.
+
+Lo que ofrece el sistema:
+
+- Registro de un jugador con nickname y correo.
+- Emparejamiento automático: el primero que espera juega con el siguiente que llega.
+- Partidas simultáneas, cada una a 30 ticks por segundo, hasta que alguien llega a 5 puntos.
+- Notificación al terminar la partida y posibilidad de jugar otra vez sin reconectarse.
+- Detección de clientes caídos y manejo de mensajes mal formados.
+
+---
+
+## 2. Desarrollo
+
+### 2.1 Arquitectura
 
 ```
    PongClient A ──┐                    ┌──────────────── PongServer (C) ─────────────────┐
- (Python + pygame)│      TCP           │ main thread ── accept() loop                    │
-                  ├───────────────────►│   └─ 1 client thread per connection             │
-   PongClient B ──┘   PongProtocol     │ lobby ── list of available players              │
-                                       │   └─ 1 match thread per game (30 ticks/s)       │
-                                       │ logger ── console + log file (thread-safe)      │
+ (Python + pygame)│      TCP           │ hilo principal ── accept()                      │
+                  ├───────────────────►│   └─ 1 hilo por cliente conectado               │
+   PongClient B ──┘   PongProtocol     │ lobby ── empareja jugadores en espera           │
+                                       │   └─ 1 hilo por partida (30 ticks/s)            │
+                                       │ logger ── consola + archivo (con mutex)         │
                                        └─────────────────────────────────────────────────┘
 ```
 
-- **Main thread**: creates the listening socket and calls `accept()` forever. Every new connection gets its own thread.
-- **Client thread**: blocks on `recv()`, decodes the client's messages and acts on them (registration, the list of available players, choosing an opponent, paddle input).
-- **Match thread**: one per active game. Every tick it applies the inputs, moves the ball and paddles, detects collisions and goals, and sends the new state to both players.
-- **Logger**: every relevant event (connections, registrations, matchmaking, goals, errors, disconnections) is printed to the console and appended to the log file under a mutex, so lines from different threads never mix.
+- **Hilo principal:** crea el socket de escucha y llama a `accept()` en un ciclo. Cada conexión nueva
+  recibe su propio hilo.
+- **Hilo de cliente:** se queda en `recv()`, decodifica lo que llega y actúa (registro, entrar a la
+  cola, movimiento de la paleta).
+- **Hilo de partida:** uno por cada juego activo. En cada tick aplica los inputs, mueve la bola,
+  detecta choques y goles, y envía el estado a los dos jugadores.
+- **Logger:** todo evento relevante sale por consola y se agrega al archivo de log, protegido con un
+  mutex para que las líneas de distintos hilos no se mezclen.
 
-**Why one thread per client?** `recv()` blocks: a thread waiting for one client cannot serve anyone else.
-With a thread per client, each one waits only for its own client, so all players are served at the same
-time. The alternative, a single thread multiplexing sockets with `select()`/`poll()`, scales better to
-thousands of connections, but it is harder to follow. For the scale of this project (tens of players) threads
-are enough, the assignment explicitly allows them, and each thread reads like a simple sequential program.
+Elegimos un hilo por cliente porque `recv()` bloquea y así cada jugador se atiende por separado, con
+código secuencial fácil de seguir. Pensamos en `select()`/`poll()`, que escala mejor, pero para las
+decenas de jugadores que espera este proyecto no valía la pena la complejidad extra, y el enunciado
+permite hilos.
 
-**Server source files (`server/`)**
+**Archivos del servidor (`server/`)**
 
-| File | Responsibility |
+| Archivo | Qué hace |
 |---|---|
-| `main.c` | Listening socket, `accept()` loop, one detached thread per client. |
-| `session.c` | What a client thread does: read messages, apply the state machine of 2.3.7, answer. Also the registry of connected nicknames (protected by a mutex). |
-| `protocol.c` | PongProtocol v1 only: exact `send`/`recv` of bytes, header and payload encoding/decoding, validation. It knows nothing about threads or sessions. |
-| `sockopts.c` | Options set on every client socket (`TCP_NODELAY`, keepalive, `TCP_USER_TIMEOUT`). |
-| `player.c` | The `Player` object shared between threads, and `player_send()` (one writer at a time per socket). |
-| `lobby.c` | Lobby: the list of available players, `USER_LIST`, choosing an opponent (`PLAY_WITH`). |
-| `game.c` | Matches: creation, the match thread (game loop and physics), and how a match ends. |
-| `server.h` | The `Server` context: all the state shared between threads (no global variables). |
-| `logger.c` | Thread-safe logger (see 2.4). |
+| `main.c` | Socket de escucha, ciclo de `accept()` y un hilo por cliente. |
+| `session.c` | Lo que hace el hilo de un cliente: leer mensajes, aplicar la máquina de estados (2.3.7) y responder. Aquí también está el registro de nicknames. |
+| `protocol.c` | Solo el protocolo: enviar y recibir bytes exactos, codificar y decodificar cabeceras y payloads, validar. No sabe nada de hilos ni de sesiones. |
+| `sockopts.c` | Opciones de cada socket de cliente (`TCP_NODELAY`, keepalive, `TCP_USER_TIMEOUT`). |
+| `player.c` | El objeto `Player` que comparten varios hilos y `player_send()`. |
+| `lobby.c` | Cola de emparejamiento: un solo puesto de espera, primero en llegar, primero en jugar. |
+| `game.c` | Creación y vida de las partidas, hilo de juego, física y fin de partida. Aquí vive `game_lock`. |
+| `logger.c` | Logger seguro entre hilos (ver 2.4). |
 
-**Game loop (authoritative server).** Each match thread runs a fixed-timestep loop at 30 ticks/s:
-take a snapshot of both players' last `INPUT` (under `game_lock`) → move the paddles (fixed speed, clamped
-to the field) → move the ball, bounce it on the walls and paddles (the bounce angle depends on where it
-hits the paddle, and every hit makes it 6% faster, up to a limit that keeps it from skipping over a
-paddle) → detect goals → send `STATE` to both players. Ticks are scheduled on absolute deadlines
-(`clock_nanosleep` with `TIMER_ABSTIME`), so the time spent simulating and sending never makes the game
-drift slower. Clients only send *intentions* (up / down / stop), never positions. That is how the server
-validates every move: a client simply cannot place its paddle or the ball anywhere. After each goal, the
-ball waits ~0.7 s in the centre and is served toward the player who conceded.
+**Ciclo de juego.** El servidor es la única autoridad. Cada partida corre un ciclo de paso fijo a 30
+ticks/s: toma una copia de la última dirección pedida por cada jugador (bajo `game_lock`), mueve las
+paletas a velocidad fija sin salirse de la cancha, mueve la bola, la hace rebotar en paredes y
+paletas, revisa goles y manda `STATE` a ambos. Los clientes solo envían intenciones (subir, bajar,
+parar), nunca posiciones, así que ninguno puede mover su paleta o la bola a donde quiera.
 
-**Shared state and synchronization.** Several threads work on the same player: its own client thread,
-the client thread of the player who chooses it as opponent, and the match thread. Three mechanisms keep this safe:
+Detalles de la física:
 
-| Mechanism | Protects | Why |
+- El ángulo de rebote depende de en qué parte de la paleta pega la bola.
+- Cada golpe aumenta la velocidad un 6 %, con un tope (16) menor que `PADDLE_W + BALL_SIZE`. Si no, la
+  bola podría atravesar una paleta de un tick a otro.
+- Después de cada gol la bola espera unos 0,7 s en el centro y se saca hacia quien recibió el gol.
+- Los ticks se programan con plazos absolutos (`clock_nanosleep` con `TIMER_ABSTIME`). Un `sleep` de
+  33 ms hubiera hecho el juego más lento, porque simular y enviar también toman tiempo.
+
+**Estado compartido y sincronización.** Sobre un mismo jugador pueden actuar tres hilos a la vez: el
+suyo, el del jugador que lo empareja y el de la partida. Usamos tres mecanismos:
+
+| Mecanismo | Protege | Por qué |
 |---|---|---|
-| `game_lock` (one mutex for the whole game) | The list of available players, each player's state / match / side, every match | Choosing an opponent, leaving and state changes are *check-then-act* operations: without the lock, two players choosing the same opponent at the same moment could both get a match with it. One lock is simple and enough here, because the critical sections are tiny and network sends happen outside it. |
-| `send_lock` (one mutex per player) | Writing to that player's socket | The client thread, the lobby and the match thread may all send to the same client. The lock keeps the bytes of two messages from interleaving on the wire. |
-| `refs` counter + condition variable | The lifetime of a `Player` | A match keeps using its players (it sends `GAME_OVER` to them). A client thread whose player is still referenced waits (`pthread_cond_wait`) before it ends. Otherwise the match could write to freed memory, or to a socket number the OS has already reused for a new client. |
+| `game_lock` (un mutex global) | La cola, el estado de cada jugador y todas las partidas | Emparejar y salir son operaciones de "mirar y luego actuar". Sin el lock, dos jugadores que entran al mismo tiempo podrían emparejarse con el mismo jugador en espera. Las secciones críticas son cortas y los envíos por red se hacen fuera del lock (con una excepción, ver abajo). |
+| `send_lock` (uno por jugador) | Escritura en su socket | El hilo del cliente, la cola y la partida pueden enviarle mensajes. El lock evita que los bytes de dos mensajes se entremezclen. |
+| contador `refs` + variable de condición | La vida del `Player` | Una partida sigue usando a sus jugadores incluso para mandar `GAME_OVER`. Si el hilo del cliente terminara antes, la partida escribiría en memoria liberada o en un descriptor que el sistema ya reasignó. Por eso ese hilo espera con `pthread_cond_wait` hasta que `refs` llega a 0. |
 
-Message order is guaranteed by design: `WAITING` and `USER_LIST` are sent while `game_lock` is held, so no
-`MATCH_START` can overtake them. The match thread is the only sender of `MATCH_START`, `STATE` and `GAME_OVER`.
+La excepción: `WAITING` se envía con `game_lock` tomado. Así ningún `MATCH_START` puede adelantarlo, y
+el cliente siempre ve `WAITING` y después `MATCH_START`. Son 4 bytes en un socket vacío, así que el
+`send()` no bloquea. Después, el único que envía `MATCH_START`, `STATE` y `GAME_OVER` es el hilo de la
+partida.
 
-**No global variables.** All the shared state (the logger, the nickname registry, the list of available
-players, `game_lock` and its condition variable) lives in one `Server` struct (`server.h`). `main()` creates
-it and every module receives a pointer to it, directly or through `Player->srv` and `Match->srv`. Each
-field documents which lock protects it, so the dependencies between threads are explicit in the code.
+### 2.2 Transporte: por qué TCP
 
-### 2.2 Transport: why TCP
+PongProtocol usa solo **TCP (`SOCK_STREAM`)**, con una conexión por cliente.
 
-PongProtocol runs over **TCP (`SOCK_STREAM`)** only, with one connection per client.
-
-| Concern | With TCP | With UDP |
+| Aspecto | TCP | UDP |
 |---|---|---|
-| Control messages (`REGISTER`, `MATCH_START`, `GAME_OVER`…) | Delivered reliably and in order. Losing one would break the state machine. | We would have to reimplement acknowledgements, retransmissions and ordering. |
-| Game state (`STATE`, 30 per second) | A lost segment delays the following ones (*head-of-line blocking*). | A lost packet could simply be skipped. |
-| NAT / firewalls | The client opens the connection, so it works behind home routers. | The server must learn and keep each client's UDP address and port alive. |
-| Complexity | One socket per client, one code path. | Two sockets (or a custom reliability layer). |
+| Mensajes de control (`REGISTER`, `MATCH_START`, `GAME_OVER`…) | Llegan completos y en orden. Perder uno rompería la máquina de estados. | Habría que implementar confirmaciones, reenvíos y orden. |
+| Estado del juego (`STATE`, 30 por segundo) | Un segmento perdido retrasa los siguientes (*head-of-line blocking*). | Un paquete perdido se podría ignorar. |
+| NAT y firewalls | El cliente abre la conexión, así que funciona detrás de un router casero. | El servidor tendría que recordar y mantener viva la dirección UDP de cada cliente. |
+| Complejidad | Un socket por cliente y un solo camino de código. | Dos sockets o una capa propia de fiabilidad. |
 
-Our messages are tiny (`STATE` is 14 bytes, about 420 B/s per player), and packet loss on today's
-Internet is low, so head-of-line blocking is rarely noticeable. In exchange we get a much simpler and more
-robust protocol. Two TCP options adapt it to a real-time game:
+Nuestros mensajes son pequeños (un `STATE` ocupa 14 bytes con cabecera, unos 420 B/s por jugador) y
+en redes actuales la pérdida de paquetes es baja, así que el bloqueo por pérdida casi no se nota. A
+cambio, el protocolo queda mucho más simple. Para que TCP se comporte mejor en un juego en tiempo real
+activamos `TCP_NODELAY`, que desactiva el algoritmo de Nagle (el que retiene mensajes pequeños para
+agruparlos), de modo que cada `STATE` e `INPUT` sale de inmediato.
 
-- **`TCP_NODELAY`**: disables Nagle's algorithm, which would otherwise hold small messages for a while to group them. Every `STATE`/`INPUT` leaves immediately.
-- **Dead-peer detection**: see [Liveness](#237-procedure-rules).
+### 2.3 Especificación de PongProtocol v1
 
-### 2.3 PongProtocol v1 specification
+#### 2.3.1 Servicio
 
-#### 2.3.1 Service
+Con PongProtocol un cliente puede:
 
-PongProtocol lets a client:
+1. **Registrarse** con nickname y correo.
+2. **Entrar a la cola** de emparejamiento y jugar contra el siguiente que espere.
+3. **Jugar:** envía la dirección de su paleta (arriba, abajo, quieto). El servidor simula el juego y
+   envía el estado a ambos jugadores 30 veces por segundo.
+4. **Enterarse del fin de la partida** (alguien llegó a 5 puntos o el rival se fue) y volver a
+   entrar a la cola sin reconectarse.
+5. **Salir** en cualquier momento.
 
-1. **Register** a player profile (nickname + e-mail) on the server.
-2. **See the list of available players and choose its opponent**, or make itself available so that another player can choose it.
-3. **Play** a match: the client sends its paddle *intention* (up / down / stop); the server, which is the only authority on the game state, simulates the match and broadcasts the state to both players 30 times per second.
-4. Be **notified** when the match ends (a player reached 5 points, or the opponent left), and **join again** without reconnecting.
-5. **Leave** at any time.
+#### 2.3.2 Reglas de codificación
 
-#### 2.3.2 Encoding rules
+- Todo mensaje es una **cabecera de 4 bytes** seguida de un **payload** de `length` bytes (0 a 255).
+- Los enteros de más de un byte son sin signo y van en **orden de red (big-endian)**.
+- Los textos llevan su longitud antes: un `u8` con el largo y luego los bytes. No hay `\0` final.
+  Solo ASCII.
+- Tipos: `u8` = 1 byte, `u16` = 2 bytes.
 
-- Every message is a **4-byte header** followed by a **payload** of `length` bytes (0–255).
-- All multi-byte integers are unsigned and in **network byte order (big-endian)**.
-- Strings are **length-prefixed**: one `u8` with the length, then the bytes. There is no terminating `\0`. Characters are ASCII.
-- Types: `u8` = 1 byte, `u16` = 2 bytes.
+Los números van como enteros y nunca como flotantes, así evitamos serializar `float`. El servidor
+simula con `double` internamente y redondea al enviar.
 
-**Header**
+**Cabecera**
 
-| Offset | Size | Field | Description |
+| Offset | Tamaño | Campo | Descripción |
 |---|---|---|---|
-| 0 | u8 | `version` | Protocol version. Always `1`. |
-| 1 | u8 | `type` | Message type (see vocabulary). |
-| 2 | u16 | `length` | Payload size in bytes. Must be ≤ 255. |
+| 0 | u8 | `version` | Versión del protocolo. Siempre `1`. |
+| 1 | u8 | `type` | Tipo de mensaje. |
+| 2 | u16 | `length` | Tamaño del payload en bytes, máximo 255. |
 
-**Framing.** TCP is a byte stream: one `recv()` can return part of a message, or several messages glued
-together. The receiver always reads **exactly 4 bytes** (the header), then **exactly `length` bytes** (the
-payload), looping on `recv()` until each part is complete.
+**Delimitación de mensajes.** TCP entrega un flujo de bytes: un `recv()` puede traer la mitad de un
+mensaje o varios pegados. Por eso el receptor siempre lee **exactamente 4 bytes** (la cabecera) y
+después **exactamente `length` bytes**, repitiendo `recv()` hasta completar cada parte.
 
-#### 2.3.3 Message vocabulary
+#### 2.3.3 Vocabulario de mensajes
 
-Types with the high bit set (`0x80`) are sent by the server.
+Los tipos con el bit alto en 1 (`0x80`) los envía el servidor.
 
-| Type | Name | Direction | Payload size | Meaning |
+| Tipo | Nombre | Dirección | Payload | Significado |
 |---|---|---|---|---|
-| `0x01` | `REGISTER` | C → S | variable | Create my player profile. |
-| `0x02` | `JOIN` | C → S | 0 | I am available: others may choose me as their opponent. |
-| `0x03` | `INPUT` | C → S | 1 | My paddle direction changed. |
-| `0x04` | `QUIT` | C → S | 0 | I am leaving; close the connection. |
-| `0x05` | `LIST` | C → S | 0 | Which players are available right now? |
-| `0x06` | `PLAY_WITH` | C → S | variable | I want to play against this available player. |
-| `0x81` | `REGISTER_OK` | S → C | 0 | Registration accepted. |
-| `0x82` | `WAITING` | S → C | 0 | You are available; waiting for someone to choose you. |
-| `0x83` | `MATCH_START` | S → C | variable | A match begins: your side and your opponent. |
-| `0x84` | `STATE` | S → C | 10 | Current positions and score (every tick). |
-| `0x85` | `GAME_OVER` | S → C | 2 | The match ended. |
-| `0x86` | `USER_LIST` | S → C | variable | The players available right now (answer to `LIST`). |
-| `0xFF` | `ERROR` | S → C | 1 | Your last message was rejected. |
+| `0x01` | `REGISTER` | C → S | variable | Crear mi perfil. |
+| `0x02` | `JOIN` | C → S | 0 | Ponerme en la cola. |
+| `0x03` | `INPUT` | C → S | 1 | Cambió la dirección de mi paleta. |
+| `0x04` | `QUIT` | C → S | 0 | Me voy; cierra la conexión. |
+| `0x81` | `REGISTER_OK` | S → C | 0 | Registro aceptado. |
+| `0x82` | `WAITING` | S → C | 0 | Estás en cola, esperando rival. |
+| `0x83` | `MATCH_START` | S → C | variable | Empieza la partida: tu lado y tu rival. |
+| `0x84` | `STATE` | S → C | 10 | Posiciones y marcador (en cada tick). |
+| `0x85` | `GAME_OVER` | S → C | 2 | Terminó la partida. |
+| `0xFF` | `ERROR` | S → C | 1 | Tu último mensaje fue rechazado. |
 
-#### 2.3.4 Payload layouts
+#### 2.3.4 Estructura de los payloads
 
 **`REGISTER` (0x01)**
 
-| Offset | Size | Field | Rule |
+| Offset | Tamaño | Campo | Regla |
 |---|---|---|---|
 | 0 | u8 | `nick_len` | 1–16 |
-| 1 | `nick_len` | `nick` | letters, digits, `_` or `-` |
+| 1 | `nick_len` | `nick` | letras, dígitos, `_` o `-` |
 | 1 + n | u8 | `email_len` | 3–64 |
-| 2 + n | `email_len` | `email` | printable ASCII, contains `@` |
+| 2 + n | `email_len` | `email` | ASCII imprimible, con `@` |
 
-The header's `length` must be exactly `2 + nick_len + email_len`.
+El `length` de la cabecera debe ser exactamente `2 + nick_len + email_len`.
 
-**`INPUT` (0x03)**
-
-| Offset | Size | Field | Values |
-|---|---|---|---|
-| 0 | u8 | `dir` | `0` = stop, `1` = up, `2` = down |
-
-**`PLAY_WITH` (0x06)**
-
-| Offset | Size | Field | Rule |
-|---|---|---|---|
-| 0 | u8 | `nick_len` | 1–16 |
-| 1 | `nick_len` | `nick` | the chosen opponent (same rules as in `REGISTER`, compared ignoring case) |
-
-The header's `length` must be exactly `1 + nick_len`.
+**`INPUT` (0x03):** un byte `dir`: `0` = quieto, `1` = arriba, `2` = abajo.
 
 **`MATCH_START` (0x83)**
 
-| Offset | Size | Field | Values |
+| Offset | Tamaño | Campo | Valores |
 |---|---|---|---|
-| 0 | u8 | `side` | `0` = left paddle, `1` = right paddle |
+| 0 | u8 | `side` | `0` = paleta izquierda, `1` = derecha |
 | 1 | u8 | `opp_len` | 1–16 |
-| 2 | `opp_len` | `opp_nick` | opponent's nickname |
+| 2 | `opp_len` | `opp_nick` | nickname del rival |
 
-**`STATE` (0x84)**: always 10 bytes.
+**`STATE` (0x84):** siempre 10 bytes.
 
-| Offset | Size | Field | Description |
+| Offset | Tamaño | Campo | Descripción |
 |---|---|---|---|
-| 0 | u16 | `ball_x` | ball's top-left corner, x |
-| 2 | u16 | `ball_y` | ball's top-left corner, y |
-| 4 | u16 | `left_y` | left paddle's top edge, y |
-| 6 | u16 | `right_y` | right paddle's top edge, y |
-| 8 | u8 | `score_l` | left player's score |
-| 9 | u8 | `score_r` | right player's score |
+| 0 | u16 | `ball_x` | esquina superior izquierda de la bola, x |
+| 2 | u16 | `ball_y` | esquina superior izquierda de la bola, y |
+| 4 | u16 | `left_y` | borde superior de la paleta izquierda |
+| 6 | u16 | `right_y` | borde superior de la paleta derecha |
+| 8 | u8 | `score_l` | puntos del jugador izquierdo |
+| 9 | u8 | `score_r` | puntos del jugador derecho |
 
-**`GAME_OVER` (0x85)**
+**`GAME_OVER` (0x85):** `winner` (u8: `0` izquierda, `1` derecha) y `reason` (u8: `0` alguien llegó
+al puntaje, `1` el rival se fue).
 
-| Offset | Size | Field | Values |
+**`ERROR` (0xFF):** un byte `code` (ver 2.3.5).
+
+`JOIN`, `QUIT`, `REGISTER_OK` y `WAITING` no llevan payload (`length` = 0).
+
+#### 2.3.5 Códigos de error
+
+| Código | Nombre | Cuándo | Conexión |
 |---|---|---|---|
-| 0 | u8 | `winner` | `0` = left, `1` = right |
-| 1 | u8 | `reason` | `0` = a player reached the winning score, `1` = the opponent left |
+| 1 | `BAD_VERSION` | `version` ≠ 1 | **se cierra** |
+| 2 | `BAD_MESSAGE` | tipo desconocido, `length` > 255 o que no coincide con la estructura | **se cierra** |
+| 3 | `NICK_TAKEN` | otro jugador conectado ya usa ese nickname | sigue abierta, puede reintentar |
+| 4 | `INVALID_STATE` | el mensaje no se permite en el estado actual | sigue abierta, se ignora el mensaje |
+| 5 | `INVALID_FIELD` | un campo rompe su regla (nick vacío, correo sin `@`, `dir` > 2) | sigue abierta, se ignora el mensaje |
 
-**`USER_LIST` (0x86)**
+Los códigos 1 y 2 cierran la conexión porque, tras una cabecera mala, el receptor ya no sabe dónde
+empieza el siguiente mensaje: el flujo quedó desincronizado.
 
-| Offset | Size | Field | Description |
-|---|---|---|---|
-| 0 | u8 | `count` | number of nicks that follow |
-| 1 | — | `count` × (`nick_len`:u8, `nick`) | the available players, in the order they became available |
-
-The list never includes the player who asked. It must fit in one message (255 bytes): at least 14 nicks
-always fit. If more players are available, the oldest ones are listed and the rest are left out.
-
-**`ERROR` (0xFF)**
-
-| Offset | Size | Field | Values |
-|---|---|---|---|
-| 0 | u8 | `code` | see error codes |
-
-`JOIN`, `QUIT`, `LIST`, `REGISTER_OK` and `WAITING` have an empty payload (`length` = 0).
-
-#### 2.3.5 Error codes
-
-| Code | Name | When | Connection |
-|---|---|---|---|
-| 1 | `BAD_VERSION` | `version` ≠ 1 | **closed** |
-| 2 | `BAD_MESSAGE` | unknown `type`, `length` > 255, or `length` doesn't match the message layout | **closed** |
-| 3 | `NICK_TAKEN` | another connected player already uses that nickname | stays open (client may retry) |
-| 4 | `INVALID_STATE` | the message isn't allowed in the client's current state | stays open (message ignored) |
-| 5 | `INVALID_FIELD` | a field breaks its rule (e.g. empty nick, e-mail without `@`, `dir` > 2) | stays open (message ignored) |
-| 6 | `USER_NOT_AVAILABLE` | `PLAY_WITH` names a player who is not available (unknown, not in the list, already chosen by someone else, or yourself) | stays open |
-
-Codes 1 and 2 close the connection because, after a malformed header, the receiver can no longer tell
-where the next message starts: the byte stream is out of sync.
-
-**Validation order.** The server checks every incoming message in this order and answers with the first
-error it finds:
+**Orden de validación.** El servidor revisa cada mensaje en este orden y responde con el primer error:
 
 1. `version` ≠ 1 → `ERROR(1)`.
 2. `length` > 255 → `ERROR(2)`.
-3. `type` is not a message a client may send → `ERROR(2)`. (Up to here the payload is **not** read.)
-4. The message is not allowed in the client's state → `ERROR(4)`, except a late `INPUT` (rule 7 in 2.3.7).
-5. The payload does not fit the message layout (e.g. `length` ≠ 2 + `nick_len` + `email_len`, or a non-empty `JOIN`/`QUIT`/`LIST`) → `ERROR(2)`.
-6. A field breaks its rule (2.3.4) → `ERROR(5)`.
+3. `type` que un cliente no puede enviar → `ERROR(2)`. Hasta aquí no se lee el payload.
+4. Mensaje no permitido en el estado actual → `ERROR(4)` (excepto un `INPUT` tardío, regla 7).
+5. El payload no calza con la estructura (por ejemplo `length` ≠ `2 + nick_len + email_len`, o un
+   `JOIN`/`QUIT` con payload) → `ERROR(2)`.
+6. Un campo rompe su regla → `ERROR(5)`.
 
-When the server closes the connection after `ERROR(1)` or `ERROR(2)`, it first stops sending
-(`shutdown`) and discards, for at most about 3 seconds, whatever the client is still sending. Closing a
-socket that has unread incoming data makes Linux reset the connection (RST), and the client could lose
-the `ERROR` message that was just sent.
+**Cierre con "lingering".** Cuando el servidor cierra tras un `ERROR(1)` o `ERROR(2)`, primero hace
+`shutdown(SHUT_WR)` y lee y descarta durante unos 3 s lo que el cliente siga enviando. Si se hace
+`close()` con datos sin leer, Linux manda un RST y el cliente puede perder el `ERROR` que acabamos de
+enviarle.
 
-#### 2.3.6 Game constants
+#### 2.3.6 Constantes del juego
 
-Both applications use these fixed values. They are part of the specification and are never sent.
+Ambas aplicaciones usan estos valores fijos. Son parte de la especificación y nunca se envían.
 
-| Constant | Value |
+| Constante | Valor |
 |---|---|
-| Field size | 800 × 600 units. Origin at the top-left corner, x grows right, y grows down. |
-| Paddle size | 10 × 80. Left paddle at x = 20, right paddle at x = 770. |
-| Ball size | 10 × 10 |
-| Tick rate | 30 ticks/s: one `STATE` to each player every ~33 ms |
-| Winning score | 5 |
+| Cancha | 800 × 600. Origen arriba a la izquierda, x crece a la derecha, y hacia abajo. |
+| Paleta | 10 × 80. Izquierda en x = 20, derecha en x = 770. |
+| Bola | 10 × 10 |
+| Tick | 30 por segundo: un `STATE` a cada jugador cada ~33 ms |
+| Puntaje para ganar | 5 |
 
-Positions are integers, so we never have to serialize floating-point numbers. The server is free to
-simulate internally with more precision. `ball_y` is always in 0–590 and the paddles in 0–520. `ball_x`
-is normally in 0–790, but when the ball leaves the field after a goal it may briefly be partly outside:
-values up to 800 are sent, and negative values are sent as 0.
+`ball_y` siempre está entre 0 y 590 y las paletas entre 0 y 520. `ball_x` normalmente va de 0 a 790,
+pero tras un gol la bola puede salirse un poco de la cancha: se envían valores hasta 800 y los
+negativos se envían como 0.
 
-#### 2.3.7 Procedure rules
+#### 2.3.7 Reglas de procedimiento
 
-**States (server's view of each client)**
+**Estados (vista del servidor)**
 
-| State | Allowed client messages | Anything else |
+| Estado | Mensajes permitidos | Cualquier otro |
 |---|---|---|
 | `CONNECTED` | `REGISTER`, `QUIT` | `ERROR(4)` |
-| `REGISTERED` | `JOIN`, `LIST`, `PLAY_WITH`, `QUIT` | `ERROR(4)` |
-| `WAITING` | `LIST`, `PLAY_WITH`, `QUIT` | `ERROR(4)` |
+| `REGISTERED` | `JOIN`, `QUIT` | `ERROR(4)` |
+| `WAITING` | `QUIT` | `ERROR(4)` |
 | `PLAYING` | `INPUT`, `QUIT` | `ERROR(4)` |
 
 ```mermaid
 stateDiagram-v2
-    [*] --> CONNECTED: TCP connection accepted
-    CONNECTED --> CONNECTED: REGISTER invalid or nick taken / ERROR(3 or 5)
-    CONNECTED --> REGISTERED: REGISTER valid / REGISTER_OK
-    REGISTERED --> REGISTERED: LIST / USER_LIST
-    REGISTERED --> WAITING: JOIN / WAITING
-    REGISTERED --> PLAYING: PLAY_WITH an available player / MATCH_START
-    WAITING --> PLAYING: chosen by someone, or PLAY_WITH / MATCH_START
-    PLAYING --> REGISTERED: match ends / GAME_OVER
-    CONNECTED --> [*]: QUIT, disconnect or ERROR(1 or 2)
-    REGISTERED --> [*]: QUIT or disconnect
-    WAITING --> [*]: QUIT or disconnect
-    PLAYING --> [*]: QUIT or disconnect, opponent gets GAME_OVER(reason 1)
+    [*] --> CONNECTED: conexión TCP aceptada
+    CONNECTED --> CONNECTED: REGISTER inválido o nick tomado / ERROR(3 o 5)
+    CONNECTED --> REGISTERED: REGISTER válido / REGISTER_OK
+    REGISTERED --> WAITING: JOIN, nadie esperando / WAITING
+    REGISTERED --> PLAYING: JOIN, alguien esperando / MATCH_START
+    WAITING --> PLAYING: llega un rival / MATCH_START
+    PLAYING --> REGISTERED: termina la partida / GAME_OVER
+    CONNECTED --> [*]: QUIT, desconexión o ERROR(1 o 2)
+    REGISTERED --> [*]: QUIT o desconexión
+    WAITING --> [*]: QUIT o desconexión
+    PLAYING --> [*]: QUIT o desconexión, el rival recibe GAME_OVER(reason 1)
 ```
 
-**Rules**
+**Reglas**
 
-1. **Registration first (identification).** A client must register before anything else: until the server accepts its `REGISTER`, every other message is rejected with `ERROR(4)`. This is how the server identifies (authenticates) each client: the nickname must be valid and unique among *connected* players, **ignoring upper/lower case** (`ana` and `Ana` are the same nickname), and the e-mail must be valid. Profiles live in memory and are released when the client disconnects. There are no passwords: without persistent accounts there would be nothing for a password to protect.
-2. **Choosing an opponent.** A registered player who sends `JOIN` becomes **available**: it receives `WAITING` and appears in the list of every other player. `LIST` returns that list (`USER_LIST`). `PLAY_WITH(nick)` starts a match at once against that player if it is still available: both receive `MATCH_START` and leave the list. Otherwise the answer is `ERROR(6)`. Being available means accepting to be chosen, so there is no invitation to accept. An available player may also choose someone else from the list. A player in a match does not appear in the list, and cannot start another match (`JOIN`, `LIST` and `PLAY_WITH` get `ERROR(4)`). If two players choose each other at the same moment, one match starts and the other request gets `ERROR(4)`: it crossed the `MATCH_START`.
-3. **Authoritative server.** `INPUT` only changes the paddle's *direction*. The server moves the paddle at its own fixed speed, keeps it inside the field, moves the ball, detects collisions and goals, and keeps the score. Clients never send positions.
-4. **State broadcast.** During a match, the server sends `STATE` to both players every tick. The client sends `INPUT` only when the direction **changes** (not every frame).
-5. **End of match.** When a player reaches 5 points, both receive `GAME_OVER(winner, 0)` and return to `REGISTERED`. They may `LIST`, `JOIN` or `PLAY_WITH` again on the same connection.
-6. **Opponent leaves.** If a player sends `QUIT`, disconnects, or is detected as dead during a match, the opponent receives `GAME_OVER(opponent's side, 1)` and returns to `REGISTERED`.
-7. **Late input.** An `INPUT` received outside `PLAYING` is **silently discarded**, not answered with an error. It may legitimately cross a `GAME_OVER` that is already on its way to the client.
-8. **Leaving.** After `QUIT` the server closes the connection. A player who quits while `WAITING` is removed from the list of available players.
-9. **Errors.** See error codes: protocol violations (1, 2) close the connection; semantic errors (3, 4, 5, 6) are reported and the message is ignored.
+1. **Primero registrarse.** El nickname debe ser único entre los jugadores *conectados*, sin distinguir
+   mayúsculas (`ana` y `Ana` son el mismo). Los perfiles viven en memoria y se liberan al desconectarse.
+2. **Emparejamiento.** En `JOIN`, si hay alguien esperando se emparejan de inmediato y ambos reciben
+   `MATCH_START`. Si no, el cliente recibe `WAITING`. Quien esperó más juega a la izquierda.
+3. **Servidor autoritativo.** `INPUT` solo cambia la *dirección* de la paleta. El servidor la mueve a
+   su velocidad, la mantiene dentro de la cancha, mueve la bola y lleva el marcador.
+4. **Difusión del estado.** Durante la partida el servidor envía `STATE` a ambos en cada tick. El
+   cliente envía `INPUT` solo cuando la dirección **cambia**, no en cada cuadro.
+5. **Fin de partida.** Cuando alguien llega a 5, ambos reciben `GAME_OVER(winner, 0)` y vuelven a
+   `REGISTERED`. Pueden hacer `JOIN` otra vez en la misma conexión.
+6. **El rival se va.** Si un jugador envía `QUIT`, se desconecta o se detecta como caído, el rival
+   recibe `GAME_OVER(su propio lado, 1)` y vuelve a `REGISTERED`.
+7. **`INPUT` tardío.** Un `INPUT` recibido fuera de `PLAYING` se descarta en silencio, sin error.
+   Puede ser legítimo: pudo cruzarse con un `GAME_OVER` que ya iba en camino.
+8. **Salir.** Tras `QUIT` el servidor cierra la conexión. Quien sale estando en `WAITING` se saca de
+   la cola.
+9. **Errores.** Los de protocolo (1 y 2) cierran la conexión. Los semánticos (3, 4 y 5) se avisan y
+   el mensaje se ignora.
 
-**Liveness (dead-peer detection)**
+**Detección de clientes caídos**
 
-A client can disappear without closing its connection: it loses Wi-Fi, switches networks, or its machine
-crashes. Since TCP sends nothing on an idle connection, the server would wait in `recv()` forever. A
-"ghost" player would then stay in the list of available players, or freeze a match. PongProtocol has no heartbeat message.
-Instead, the server configures every client socket with:
+Un cliente puede desaparecer sin cerrar la conexión (se cae el Wi-Fi, se apaga el equipo). Como TCP no
+envía nada en una conexión inactiva, el servidor se quedaría esperando en `recv()` para siempre, y un
+jugador fantasma ocuparía la cola o congelaría una partida. PongProtocol no tiene un mensaje de
+*heartbeat*; en su lugar configuramos cada socket del cliente así:
 
-| Socket option | Value | Covers |
+| Opción | Valor | Cubre |
 |---|---|---|
-| `SO_KEEPALIVE` + `TCP_KEEPIDLE` / `TCP_KEEPINTVL` / `TCP_KEEPCNT` | 5 s / 2 s / 3 probes | idle connections (registered or waiting players): the kernel probes a silent peer |
-| `TCP_USER_TIMEOUT` | 10 s | active connections (during a match): data sent but not acknowledged for 10 s aborts the connection |
+| `SO_KEEPALIVE` + `TCP_KEEPIDLE` / `TCP_KEEPINTVL` / `TCP_KEEPCNT` | 5 s / 2 s / 3 sondeos | conexiones inactivas (registrado o esperando): el kernel sondea al cliente en silencio |
+| `TCP_USER_TIMEOUT` | 10 s | conexiones activas (durante la partida): si lo enviado no se confirma en 10 s, se aborta |
 
-A dead client is detected within about 15 s. Its `recv()` then fails, and the server treats it exactly like
-a disconnection (rules 6 and 8). Trade-off: these options are part of the operating system (Linux), not of
-the protocol messages. The protocol stays smaller, but the behaviour depends on the server's socket
-configuration.
+Así un cliente caído se detecta en unos 10 a 15 s. Su `recv()` falla y el servidor lo trata igual que
+una desconexión (reglas 6 y 8). La contrapartida es que este comportamiento depende del sistema
+operativo (Linux) y no de los mensajes del protocolo.
 
-#### 2.3.8 Sequence diagrams
+#### 2.3.8 Diagramas de secuencia
 
-**Normal flow: register, choose an opponent, match, game over, leave**
+**Flujo normal: registro, partida, fin y salida**
 
 ```mermaid
 sequenceDiagram
-    participant A as Client A
-    participant S as Server
-    participant B as Client B
+    participant A as Cliente A
+    participant S as Servidor
+    participant B as Cliente B
     A->>S: REGISTER("ana", "ana@x.co")
     S-->>A: REGISTER_OK
     A->>S: JOIN
     S-->>A: WAITING
     B->>S: REGISTER("bob", "bob@y.co")
     S-->>B: REGISTER_OK
-    B->>S: LIST
-    S-->>B: USER_LIST(["ana"])
-    B->>S: PLAY_WITH("ana")
+    B->>S: JOIN
     S-->>A: MATCH_START(side=0, "bob")
     S-->>B: MATCH_START(side=1, "ana")
-    loop every tick (~33 ms)
+    loop cada tick (~33 ms)
         S-->>A: STATE
         S-->>B: STATE
     end
-    A->>S: INPUT(up)
-    B->>S: INPUT(down)
-    Note over S: a player reaches 5 points
+    A->>S: INPUT(arriba)
+    B->>S: INPUT(abajo)
+    Note over S: un jugador llega a 5 puntos
     S-->>A: GAME_OVER(winner=0, reason=0)
     S-->>B: GAME_OVER(winner=0, reason=0)
     A->>S: QUIT
-    Note over S: closes A's connection
+    Note over S: cierra la conexión de A
 ```
 
-**Nickname already taken, then retry**
+**Nickname repetido y reintento**
 
 ```mermaid
 sequenceDiagram
-    participant C as Client
-    participant S as Server
+    participant C as Cliente
+    participant S as Servidor
     C->>S: REGISTER("ana", "ana2@x.co")
     S-->>C: ERROR(3 NICK_TAKEN)
     C->>S: REGISTER("ana_2", "ana2@x.co")
     S-->>C: REGISTER_OK
 ```
 
-**Opponent disappears mid-match**
+**El rival desaparece durante la partida**
 
 ```mermaid
 sequenceDiagram
-    participant A as Client A
-    participant S as Server
-    participant B as Client B
+    participant A as Cliente A
+    participant S as Servidor
+    participant B as Cliente B
     S-->>A: STATE
-    S--xB: STATE (B lost its network)
-    Note over S,B: no ACK from B for 10 s, TCP_USER_TIMEOUT aborts the connection
-    Note over S: B's recv() fails, B is treated as disconnected
+    S--xB: STATE (B perdió la red)
+    Note over S,B: sin ACK de B durante 10 s, TCP_USER_TIMEOUT aborta la conexión
+    Note over S: el recv() de B falla, se trata como desconexión
     S-->>A: GAME_OVER(winner=0, reason=1)
-    Note over A: back to REGISTERED, may choose again
+    Note over A: vuelve a REGISTERED, puede hacer JOIN
 ```
 
-#### 2.3.9 Byte-level example
+#### 2.3.9 Ejemplo byte a byte
 
-`REGISTER("ana", "ana@x.co")` is 17 bytes on the wire:
+`REGISTER("ana", "ana@x.co")` ocupa 17 bytes en la red:
 
 ```
 01             version   = 1
@@ -434,14 +391,16 @@ sequenceDiagram
 
 ### 2.4 Logger
 
-Every line has the format `YYYY-MM-DD HH:MM:SS [LEVEL] message`, with `LEVEL` ∈ {`INFO`, `WARN`, `ERROR`}.
-Messages related to a client start with its `ip:port`. The same line goes to the console and to the log file.
+Cada línea tiene el formato `AAAA-MM-DD HH:MM:SS [NIVEL] mensaje`, con nivel `INFO`, `WARN` o `ERROR`.
+Los mensajes de un cliente empiezan con su `ip:puerto`, y la misma línea sale por consola y por el
+archivo.
 
-For every client message the server logs the raw bytes in hexadecimal (`RECV <TYPE> [bytes]`), then what
-it decoded, then what it answered (`SEND <TYPE>`). The hex can be compared byte by byte with the spec in
-2.3.9 or with `tcpdump`. Text fields (nickname, e-mail) are written to the log only after they pass
-validation, so a client cannot inject fake lines into the log with line breaks or control characters.
-High-frequency messages (`STATE`) are not logged. Instead, the log tells the story of every match:
+Por cada mensaje de un cliente se registra el volcado hexadecimal (`RECV <TIPO> [bytes]`), luego lo
+que se decodificó y luego lo que se respondió (`SEND <TIPO>`). Ese hex se puede comparar byte a byte
+con 2.3.9 o con `tcpdump`. Los textos (nickname, correo) solo se escriben en el log después de
+validarlos, para que un cliente no pueda inyectar líneas falsas con saltos de línea o caracteres de
+control. Los `STATE` no se registran (son 30 por segundo); en su lugar el log cuenta la historia de
+cada partida:
 
 ```
 2026-10-20 23:40:47 [INFO] match started: 'left1' (left, 127.0.0.1:44906) vs 'right1' (right, 127.0.0.1:44920)
@@ -462,202 +421,113 @@ High-frequency messages (`STATE`) are not logged. Instead, the log tells the sto
 2026-10-11 17:26:39 [WARN] 127.0.0.1:37012 rejected: unsupported protocol version 104
 ```
 
-### 2.5 Build and run
+### 2.5 Compilar y ejecutar
 
-**Server** (Linux, gcc, make):
+**Servidor** (Linux, gcc, make):
 
 ```bash
 cd server
 make
-./server <PORT> <LogFile>      # e.g. ./server 5000 pong.log
+./server <PUERTO> <ArchivoLog>      # por ejemplo: ./server 5000 pong.log
 ```
 
-**Test bot** (Python 3, standard library only, no window):
+El puerto debe estar entre 1024 y 65535.
+
+**Bot de pruebas** (Python 3, solo librería estándar, sin ventana):
 
 ```bash
 cd client
-python bot.py --nick ana                        # register, print the server's reply, send QUIT
-python bot.py --nick ana --hold 20              # stay registered for 20 s before QUIT
-python bot.py --nick ana --list                 # print the list of available players
-python bot.py --nick ana --join --hold 30       # become available and print what arrives for 30 s
-python bot.py --nick bob --challenge ana --play # choose 'ana' (when she is available) and play
-python bot.py --nick ana --play                 # find any opponent and play a whole match automatically
+python bot.py --nick ana                        # se registra, imprime la respuesta y envía QUIT
+python bot.py --nick ana --hold 20              # se queda registrado 20 s antes del QUIT
+python bot.py --nick ana --join --hold 30       # hace JOIN e imprime lo que llegue durante 30 s
+python bot.py --nick ana --play                 # hace JOIN y juega una partida completa solo
 python bot.py --nick ana --host 1.2.3.4 --port 5000 --email ana@x.co
 ```
 
-With `--play` (and no `--challenge`), the bot asks for the list every second: it chooses the first available
-player or, if nobody is available, becomes available itself and keeps looking. In the match it moves its paddle toward the ball (with a random aiming error, so goals happen),
-sends `INPUT` only when its direction changes, and leaves after `GAME_OVER`. Two `--play` bots play a
-whole match in about a minute. The test campaign used 20 bots at once (10 simultaneous matches).
+Con `--play` el bot mueve su paleta hacia la bola con un error de puntería aleatorio (para que haya
+goles) y envía `INPUT` solo cuando cambia de dirección. Dos bots con `--play` juegan una partida
+completa en más o menos un minuto.
 
-Run `bot.py --nick ana --hold 20` and, meanwhile, a second `bot.py --nick ANA`: the second one receives
-`ERROR code=3 (NICK_TAKEN)`.
+Pruebas manuales que sirven para ver el protocolo en acción:
 
-Run `bot.py --nick ana --join --hold 60` and then `bot.py --nick bob --challenge ana --hold 60`: ana receives
-`WAITING`, then both receive `MATCH_START` with opposite sides. Stop one of them with Ctrl+C: the other
-receives `GAME_OVER winner=… reason=1 (opponent left)`.
+- **Nickname repetido:** deja `bot.py --nick ana --hold 20` corriendo y lanza `bot.py --nick ANA`. El
+  segundo recibe `ERROR code=3 (NICK_TAKEN)`.
+- **Emparejamiento:** corre dos bots con `--join --hold 30`. El primero recibe `WAITING` y luego los
+  dos reciben `MATCH_START` con lados opuestos.
+- **Rival que se va:** detén uno con Ctrl+C. El otro recibe `GAME_OVER ... reason=1`.
 
-**Inspecting the protocol by hand** (Linux). A garbage message gets `ERROR(1)` and the connection is
-closed, but the server keeps running:
+**Inspección a mano** (Linux). Un mensaje basura recibe `ERROR(1)` y la conexión se cierra, pero el
+servidor sigue en pie:
 
 ```bash
 printf 'hola\n' | nc -N localhost 5000 | xxd    # -> 01ff 0001 01
-sudo tcpdump -i lo -X -nn port 5000             # raw bytes of a bot session (run the bot from the same machine)
+sudo tcpdump -i lo -X -nn port 5000             # bytes crudos de una sesión del bot
 ```
 
-**Pong client (pygame)**, Python 3 + pygame (`pip install -r client/requirements.txt`):
+**Cliente con ventana (pygame)**, Python 3 y `pip install -r client/requirements.txt`:
 
 ```bash
 cd client
-python pong_client.py                                    # asks server address (Enter = AWS), port, nick, e-mail
+python pong_client.py                                    # servidor en localhost:5000, pide nick y correo
 python pong_client.py --host 1.2.3.4 --port 5000 --nick ana --email ana@x.co
 ```
 
-**Windows executable.** For demos, the client can be packaged as a single `PongClient.exe` (~15 MB,
-Python and pygame included, nothing to install). Double-click it: a console asks for the server address
-(Enter = the AWS server `34.199.2.92`, or type e.g. `localhost`), port, nickname and e-mail, then the game window opens. It also accepts the same command-line options.
+El registro se hace por consola (si el nickname está tomado, pide otro en la misma conexión). Luego
+se abre la ventana: `J` entra a una partida (y vuelve a jugar al terminar una), `↑`/`↓` o `W`/`S`
+mueven la paleta (la tuya es la azul) y `Q` o `Esc` salen (envía `QUIT`).
 
-```bash
-cd client
-pip install pyinstaller
-pyinstaller --onefile --console --name PongClient pong_client.py   # -> client/dist/PongClient.exe
-```
+**Diseño del cliente.** Un hilo receptor se queda en `recv()` y mete cada mensaje en una cola. El
+hilo principal corre el ciclo de pygame a 60 cuadros por segundo: vacía la cola, dibuja el último
+`STATE` y envía `INPUT` solo cuando cambia la dirección (mantener una tecla envía un mensaje, no 60
+por segundo). Como solo el hilo principal envía, el socket no necesita lock. El cliente nunca calcula
+posiciones: dibuja lo que dice el servidor.
 
-The executable is a build product, so it is not stored in git (`client/dist/` is ignored).
+### 2.6 Límites conocidos
 
-Registration happens in the console (if the nickname is taken, it asks for another one on the same
-connection). Then the window opens with the list of available players (refreshed every 1.5 s with `LIST`):
-`1`–`9` plays against that player, `J` makes you available so that others can choose you, `↑`/`↓` or
-`W`/`S` move the paddle (yours is the blue one), and `Q` or `Esc` quits (sends `QUIT`). The score is always
-on screen during the match, and the final score is shown when it ends.
-
-**Client design.** A receiver thread blocks on `recv()` and puts every message in a thread-safe queue,
-while the main thread runs the pygame loop at 60 frames/s: it empties the queue, draws the last `STATE`,
-and sends `INPUT` only when the paddle direction changes (holding a key sends one message, not 60 per
-second). Only the main thread sends, so the client needs no lock on its socket. The client never computes
-positions: it only draws what the server says.
-
-### 2.6 Deployment on AWS (EC2, AWS Academy Learner Lab)
-
-PongServer runs on an EC2 instance with a fixed public address: **`34.199.2.92`, port 5000**.
-
-| Item | Value |
-|---|---|
-| Region / AMI / type | `us-east-1` · Ubuntu Server 26.04 LTS · `t2.micro` |
-| Key pair | `vockey` (Learner Lab key, `labsuser.pem`) |
-| Public address | **Elastic IP `34.199.2.92`**, associated with the instance. It survives stop/start, unlike the default public IP |
-| Security group `pong-sg` (inbound) | **TCP 5000 from `0.0.0.0/0`** (players from any network) · **SSH 22 from "My IP" only** (administration) |
-| Code | `git clone` of this repository, using a read-only **deploy key** (an SSH key of the instance registered in GitHub → Settings → Deploy keys) |
-| Process | `./server 5000 pong.log` inside a `tmux` session, so it keeps running after SSH disconnects |
-
-First deployment:
-
-```bash
-# on your machine
-ssh -i ~/.ssh/labsuser.pem ubuntu@34.199.2.92         # labsuser.pem with chmod 400
-
-# on the instance
-sudo apt update && sudo apt install -y build-essential git tmux
-ssh-keygen -t ed25519 -C "pong-ec2-deploy" -f ~/.ssh/id_ed25519   # add the .pub as a deploy key in GitHub
-git clone git@github.com:mgarciac10/ProyectoN1-Pong.git
-cd ProyectoN1-Pong/server && make
-tmux new -s pong                                       # then: ./server 5000 pong.log
-                                                       # detach: Ctrl+B, D · back: tmux attach -t pong
-```
-
-After every new Learner Lab session (the lab stops the instance when the session ends): start the
-instance (the Elastic IP stays the same), then on the instance run
-`cd ~/ProyectoN1-Pong && git pull && cd server && make` and start the server again in `tmux`.
-Without an Elastic IP, the public IP would change at every start. The Elastic IP is released at the end
-of the course (EC2 → Elastic IPs → Release), because AWS charges for public IPv4 addresses. If SSH hangs
-(timeout), your own public IP has probably changed: update the SSH rule of `pong-sg` to "My IP".
-
-Clients connect with `PongClient.exe` (Enter at "Server address") or `python pong_client.py --host 34.199.2.92`. The log is
-`~/ProyectoN1-Pong/server/pong.log` on the instance (`tail -f pong.log` to watch it live).
-
-### 2.7 Testing
-
-The system was built in small phases, and every phase was tested before moving on. Besides playing with
-the pygame client, the tests used four tools:
-
-- **Hand-written bytes.** Short Python scripts open raw sockets and send exact byte sequences (valid
-  messages, and also every kind of malformed one), then compare the server's answer byte by byte with the
-  specification. `tcpdump` was used to look at the bytes on the wire.
-- **The bot** (`client/bot.py`), a client without a window that registers, lists, chooses or waits for
-  an opponent and plays a whole match by itself. It was used to run many clients at once.
-- **Sanitizers.** The server was also built with `-fsanitize=thread` (ThreadSanitizer, finds data races)
-  and `-fsanitize=address,undefined` (finds memory errors and undefined behaviour), and every test was run
-  against those builds as well. The code also builds with `-Wall -Wextra -Wpedantic -Wshadow
-  -Wconversion` with no warnings.
-- **Headless client.** The pygame client was driven automatically (virtual video driver, simulated key
-  presses, screenshots) to check its whole flow.
-
-| Area | What was checked | Result |
-|---|---|---|
-| Framing | A message sent one byte at a time; two messages glued in one `send()`; peer closing mid-message | Correct |
-| Registration | Valid / invalid fields (`ERROR(5)`), nickname taken ignoring case (`ERROR(3)`) and retry on the same connection, nickname freed after `QUIT` or an abrupt reset | Correct |
-| Protocol errors | Wrong version, unknown type, server-only type sent by a client, `length` > 255, payload not matching the layout, plain text (`hola\n`) → `ERROR(1)`/`ERROR(2)` and close | Correct, the server keeps running |
-| State rules | Every message outside its state → `ERROR(4)`; a late `INPUT` silently discarded | Correct |
-| Lobby | `LIST`/`USER_LIST`, `PLAY_WITH` an available / unknown / unavailable player / yourself (`ERROR(6)`), available player leaving, list never longer than 255 bytes | Correct |
-| Races | 40 clients registering the **same** nickname at once → exactly 1 accepted · 20 clients choosing the **same** opponent at once → exactly 1 match, 19 `ERROR(6)` | Correct |
-| Game | 30 `STATE`/s, paddle speed and limits, ball always in the field, goals, end at 5 points, opponent leaving → `GAME_OVER(reason 1)`, playing again on the same connection | Correct |
-| Concurrency | **10 simultaneous matches** (20 bots), locally and on AWS. The thread count is always 1 + clients + matches, and goes back to 1 when everyone leaves | All matches end by score |
-| Sanitizers | ThreadSanitizer and AddressSanitizer + UndefinedBehaviorSanitizer on all the scenarios above | 0 reports |
-| Robustness | `SIGPIPE` experiment: without `SIG_IGN` the server dies when it writes to a closed connection, with it every client is served · half-open connection (phone switching from Wi-Fi to mobile data) → detected by keepalive | As designed |
-| Internet | Clients on Windows, WSL, a phone on Wi-Fi and on mobile data, against the EC2 server: ~77 ms round trip | Playable |
-
-**Bugs found by testing and fixed** (selection): a committed `main.c` that did not compile (missing
-brace); a nickname released ~1 s late after `QUIT`, which would have left ghost players in the lobby; a
-bot with too small a dead zone that sent ~25 `INPUT`/s (now ~9); a bot that gave up after 30 s of waiting
-for an opponent.
+- La cola tiene un solo puesto: nunca hay más de un jugador esperando.
+- El servidor no se apaga de forma ordenada; el ciclo de `accept()` no termina (hay que matarlo con
+  Ctrl+C).
+- Solo IPv4.
+- Un hilo por cliente no escala a miles de conexiones.
+- Los perfiles solo viven mientras el cliente está conectado; no hay base de datos ni autenticación,
+  y el correo se pide pero no se verifica.
+- El protocolo no está cifrado (no hay TLS).
+- No hay pruebas automáticas; se probó a mano y con el bot.
+- La detección de clientes caídos depende de opciones de Linux (`TCP_USER_TIMEOUT`, `TCP_KEEPIDLE`),
+  así que el servidor no es portable a otros sistemas sin cambios.
 
 ---
 
-## 3. Conclusions
+## 3. Conclusiones
 
-- **The protocol is the contract.** Writing the specification first (service, vocabulary, encoding,
-  rules, diagrams) and only then the code let the C server and the Python client work together although
-  they share no code, only the document. Several decisions came from thinking through "what if…?"
-  cases on paper: what to do with an `INPUT` that crosses a `GAME_OVER` (discard it silently), which errors
-  must close the connection (only those after which the byte stream can no longer be trusted), and why the
-  server must send `WAITING` and `USER_LIST` before anyone can send `MATCH_START`.
-- **TCP is a byte stream, not a message stream.** This was visible from the first echo server: two lines
-  arrived in a single `recv()`. A length field in the header and loops that read *exactly* N bytes
-  (`recv_all`/`send_all`) are what turn the stream into messages. A receiver must also never trust the
-  length it receives before validating it.
-- **TCP was the right choice for this project.** Reliability and ordering come for free, the connection
-  works behind home routers (NAT), and with `TCP_NODELAY` and ~14-byte messages the game is fluid even at
-  ~77 ms of latency. The price is head-of-line blocking on lossy networks: a large-scale action game would
-  send the game state over UDP and keep the control messages on TCP.
-- **Concurrency needs explicit rules, not luck.** Thread-per-client keeps every session simple to read,
-  but shared state needs a clear discipline: one lock for the game state (simple, and enough at this
-  scale), one lock per socket so messages never interleave, a fixed lock order, and a reference counter
-  plus a condition variable so that no thread ever writes to a player that has already left. A reused
-  socket number would deliver one player's messages to a stranger. ThreadSanitizer confirmed 0 data races.
-- **Real networks fail in ways a local test never shows.** Writing to a closed socket kills the whole
-  process (`SIGPIPE`) unless it is ignored. A phone that changed networks left a "ghost" connection that
-  TCP alone never reports. Keepalive and `TCP_USER_TIMEOUT` were the answer. Firewalls (security
-  groups), changing public IPs and NAT were part of deploying on AWS too.
-- **Limitations and possible improvements.** Profiles live only in memory and there are no passwords
-  (registration identifies, it does not create accounts). A player cannot accept or decline being chosen:
-  being available means accepting. The list of available players holds at most 14 long nicknames per
-  message. One thread per client does not scale to thousands of players (`epoll` would). There is no
-  reconnection to a running match and no encryption (TLS). Natural next steps would be persistent accounts,
-  invitations with accept/decline, game state over UDP, and spectators.
+*(Esta sección es un borrador con lo que se puede afirmar a partir del código. Cámbiala por tus
+propias palabras y agrega lo que aprendiste y los resultados de tus pruebas.)*
+
+- Definir el protocolo antes de programar (cabecera fija, tipos, estados y errores) hizo que servidor
+  y cliente se pudieran escribir por separado y que el bot de pruebas sirviera como tercera
+  implementación para comparar.
+- Trabajar con sockets TCP obligó a tratar la conexión como un flujo de bytes: hay que leer
+  exactamente lo que se espera, validar antes de confiar y no suponer que un `recv()` trae un mensaje
+  completo.
+- Lo más difícil del servidor fue la concurrencia: quién puede tocar un `Player` y cuándo puede
+  liberarse. Se resolvió con un lock global, un lock por socket y un contador de referencias. *(Agrega
+  aquí un error concreto que tuvieron y cómo lo encontraron.)*
+- Los problemas de red también aparecen en lo pequeño: un `close()` con datos sin leer genera un `RST`
+  que puede borrar el `ERROR` enviado, y los clientes pueden desaparecer sin cerrar la conexión.
+  *(Si les pasó en las pruebas, cuéntalo aquí con tus palabras.)*
+- Mejoras posibles: usar `epoll`, varios puestos en la cola, un mensaje de *heartbeat* propio para no
+  depender de opciones de Linux, y pruebas automáticas.
+
+*(Agrega aquí los resultados de tus pruebas: cuántos bots probaste a la vez, qué viste en el log,
+etc. Solo escribe lo que realmente ejecutaste.)*
 
 ---
 
-## 4. References
+## 4. Referencias
 
 - B. Hall, *Beej's Guide to Network Programming*. https://beej.us/guide/bgnet/
 - B. Hall, *Beej's Guide to C Programming*. https://beej.us/guide/bgc/
 - GeeksforGeeks, *TCP Server-Client implementation in C*. https://www.geeksforgeeks.org/tcp-server-client-implementation-in-c/
 - W. Eddy, *RFC 9293: Transmission Control Protocol (TCP)*, IETF, 2022.
 - *Pong*. Wikipedia. https://en.wikipedia.org/wiki/Pong
-- Linux man pages: `socket(7)`, `tcp(7)`, `pthreads(7)`, `pthread_cond_wait(3p)`, `clock_nanosleep(2)`.
-- Python Software Foundation, *socket — Low-level networking interface* and *struct — Interpret bytes as packed binary data*. https://docs.python.org/3/library/socket.html · https://docs.python.org/3/library/struct.html
-- *pygame documentation*. https://www.pygame.org/docs/
-- *PyInstaller manual*. https://pyinstaller.org/
-- Amazon Web Services, *Amazon EC2 security groups* and *Elastic IP addresses* (EC2 User Guide). https://docs.aws.amazon.com/ec2/
-- Google, *ThreadSanitizer* and *AddressSanitizer* (sanitizers documentation). https://github.com/google/sanitizers
-- *Mermaid* diagramming syntax. https://mermaid.js.org/
+- Páginas del manual de Linux: `socket(7)`, `tcp(7)`, `pthreads(7)`.
